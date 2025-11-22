@@ -94,7 +94,6 @@ pub mod focus_royale {
             ErrorCode::SessionNotCompleted
         );
 
-        let escrow_balance = ctx.accounts.escrow.to_account_info().lamports();
         let stake_amount = escrow.stake_amount;
         
         // Transfer stake back to user

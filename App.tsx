@@ -8,7 +8,7 @@ import { verifyWork, analyzeUserStatus } from './services/geminiService';
 import { Leaderboard } from './components/Leaderboard';
 import { BiometricHUD } from './components/BiometricHUD';
 import * as solanaService from './services/solanaService';
-import { ArrowRight, ShieldCheck, Eye, RefreshCcw, Smartphone, Coffee, MessageCircle, UserX, EyeOff, Zap, Cloud, Wallet } from 'lucide-react';
+import { ArrowRight, ShieldCheck, Eye, RefreshCcw, Smartphone, Coffee, MessageCircle, UserX, EyeOff, Wallet } from 'lucide-react';
 
 const BOT_NAMES = ["ApexFocus", "DeepWorker99", "FlowState_Chad", "CryptoNomad", "ZenMaster"];
 const UPDATE_MS = 100; // 10hz update rate for animation
@@ -22,7 +22,6 @@ export default function App() {
   const [gameState, setGameState] = useState<GameState>(GameState.LOBBY);
   const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
   const [stakeAmount, setStakeAmount] = useState<number>(0.1);
-  const [workContent, setWorkContent] = useState("");
   const [players, setPlayers] = useState<Player[]>([]);
   const [selfBiometrics, setSelfBiometrics] = useState<BiometricData>({
     gazeStability: 100,
@@ -337,19 +336,28 @@ export default function App() {
       const stakeAmountLamports = Math.floor(stakeAmount * 1e9); // Convert SOL to lamports
       
       // Try to initialize escrow and deposit stake, but don't block game start if it fails
-      try {
-        // Initialize escrow if it doesn't exist
-        if (!escrowAccount) {
-          await solanaService.initializeEscrow(wallet, stakeAmountLamports);
+      // Check if Solana program is deployed first
+      const PLACEHOLDER_PROGRAM_ID = 'NativeLoader1111111111111111111111111111111';
+      const isProgramDeployed = solanaService.PROGRAM_ID.toString() !== PLACEHOLDER_PROGRAM_ID;
+      
+      if (isProgramDeployed) {
+        try {
+          // Initialize escrow if it doesn't exist
+          if (!escrowAccount) {
+            await solanaService.initializeEscrow(wallet, stakeAmountLamports);
+          }
+          
+          // Deposit stake
+          await solanaService.depositStake(wallet, stakeAmountLamports);
+        } catch (solanaError: any) {
+          // Log Solana error but don't block game start
+          console.warn('Solana transaction failed, starting game anyway:', solanaError);
+          setTxError('Note: Solana features unavailable, but game is starting in demo mode');
+          // Continue to start the game anyway
         }
-        
-        // Deposit stake
-        await solanaService.depositStake(wallet, stakeAmountLamports);
-      } catch (solanaError: any) {
-        // Log Solana error but don't block game start
-        console.warn('Solana transaction failed, starting game anyway:', solanaError);
-        setTxError('Note: Solana transaction failed, but game is starting in demo mode');
-        // Continue to start the game anyway
+      } else {
+        // Program not deployed - this is expected for demo mode
+        console.log('Solana program not deployed - running in demo mode');
       }
       
       // Start game regardless of Solana transaction status
@@ -376,7 +384,7 @@ export default function App() {
       
       // Verify work with Gemini
       setGameState(GameState.VERIFYING);
-      const result = await verifyWork(workContent);
+      const result = await verifyWork('');
       setVerificationResult(result);
       setPlayers(prev => prev.map(p => p.isSelf ? { ...p, flowScore: p.flowScore + (result.score * 2) } : p));
       setGameState(GameState.RESULTS);
@@ -401,7 +409,6 @@ export default function App() {
     try {
       await solanaService.forfeitStake(wallet);
       setGameState(GameState.LOBBY);
-      setWorkContent('');
     } catch (error: any) {
       console.error('Failed to forfeit:', error);
       setTxError(error.message || 'Failed to forfeit stake');
@@ -538,14 +545,6 @@ export default function App() {
       <header className="h-16 border-b border-gray-800 bg-dark-900 flex items-center justify-between px-6 z-20">
         <div className="flex items-center gap-4">
           <div className="text-neon-green font-black text-xl tracking-tighter">FOCUS ROYALE</div>
-          <div className="bg-dark-800 px-3 py-1 rounded border border-gray-700 flex items-center gap-2 text-xs font-mono text-gray-400">
-            <div className={`w-2 h-2 rounded-full ${isProcessingVision ? 'bg-neon-blue animate-ping' : 'bg-red-500 animate-pulse'}`}></div>
-            {isProcessingVision ? 'ANALYZING FRAMES...' : 'LIVE MONITORING'}
-          </div>
-          <div className="ml-2 text-xs font-mono text-gray-400 flex items-center gap-1">
-            {usingRemoteBackend ? <Zap size={12} className="text-neon-green" /> : <Cloud size={12} className="text-neon-blue" />}
-            {usingRemoteBackend ? 'KERNEL LINKED' : 'CLOUD MODE'}
-          </div>
         </div>
         <div className="text-4xl font-mono font-bold text-white tracking-widest">
           {sessionStartTime ? formatElapsedTime(sessionStartTime) : '00:00'}
@@ -559,25 +558,120 @@ export default function App() {
       </header>
 
       <div className="flex-1 flex overflow-hidden">
-        <div className="flex-1 bg-dark-900 relative flex flex-col">
-          <textarea className="flex-1 bg-transparent p-8 text-gray-300 text-lg font-mono outline-none resize-none leading-relaxed" placeholder="// Start your deep work here..." value={workContent} onChange={(e) => setWorkContent(e.target.value)} spellCheck={false} />
+        <div className="flex-1 bg-dark-900 relative flex flex-col items-center justify-center p-8">
+          {(() => {
+            const currentUser = players.find(p => p.isSelf);
+            if (!currentUser) return null;
+            
+            const isDistracted = currentUser.status !== 'FOCUS';
+            const getStatusIcon = (type: string) => {
+              switch (type) {
+                case 'PHONE': return <Smartphone size={24} className="text-neon-red" />;
+                case 'EYES_CLOSED': return <EyeOff size={24} className="text-neon-red" />;
+                case 'NO_FACE': return <UserX size={24} className="text-neon-red" />;
+                case 'TALKING': return <MessageCircle size={24} className="text-neon-red" />;
+                case 'EATING': return <Coffee size={24} className="text-neon-red" />;
+                default: return null;
+              }
+            };
 
-          <div className="absolute bottom-8 right-8 w-72 h-56 bg-black rounded-lg overflow-hidden border-2 border-gray-800 shadow-2xl group">
-            <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover opacity-80" />
-            <canvas ref={canvasRef} className="hidden" />
-            <BiometricHUD data={selfBiometrics} />
-            <div className="absolute top-2 left-2 bg-black/50 px-2 py-0.5 rounded text-[10px] font-mono text-neon-green border border-neon-green/30">PRESAGE ACTIVE</div>
-            <div className="absolute bottom-0 left-0 right-0 bg-black/80 p-2 transform translate-y-full group-hover:translate-y-0 transition-transform duration-200">
-              <div className="text-[9px] text-gray-500 mb-1 font-mono uppercase text-center">Dev: Force Distraction</div>
-              <div className="flex justify-between gap-1">
-                <button onClick={() => toggleSimulation('PHONE')} className={`p-1.5 rounded hover:bg-gray-700 ${selfBiometrics.distractionType === 'PHONE' ? 'bg-neon-red text-black' : 'text-gray-400'}`} title="Simulate Phone"><Smartphone size={14} /></button>
-                <button onClick={() => toggleSimulation('EATING')} className={`p-1.5 rounded hover:bg-gray-700 ${selfBiometrics.distractionType === 'EATING' ? 'bg-neon-red text-black' : 'text-gray-400'}`} title="Simulate Eating"><Coffee size={14} /></button>
-                <button onClick={() => toggleSimulation('TALKING')} className={`p-1.5 rounded hover:bg-gray-700 ${selfBiometrics.distractionType === 'TALKING' ? 'bg-neon-red text-black' : 'text-gray-400'}`} title="Simulate Talking"><MessageCircle size={14} /></button>
-                <button onClick={() => toggleSimulation('NO_FACE')} className={`p-1.5 rounded hover:bg-gray-700 ${selfBiometrics.distractionType === 'NO_FACE' ? 'bg-neon-red text-black' : 'text-gray-400'}`} title="Simulate Missing"><UserX size={14} /></button>
-                <button onClick={() => toggleSimulation('EYES_CLOSED')} className={`p-1.5 rounded hover:bg-gray-700 ${selfBiometrics.distractionType === 'EYES_CLOSED' ? 'bg-neon-red text-black' : 'text-gray-400'}`} title="Simulate Sleep"><EyeOff size={14} /></button>
+            return (
+              <div className="w-full max-w-2xl">
+                <div className={`glass-panel rounded-2xl p-8 border-2 ${
+                  isDistracted 
+                    ? 'border-neon-red bg-neon-red/10' 
+                    : 'border-neon-purple bg-neon-purple/10'
+                }`}>
+                  <div className="flex items-center justify-between mb-6">
+                    <div className="flex items-center gap-4">
+                      <div className="relative">
+                        <img 
+                          src={currentUser.avatar} 
+                          alt={currentUser.name} 
+                          className={`w-20 h-20 rounded-full border-2 ${
+                            isDistracted ? 'border-neon-red' : 'border-neon-purple'
+                          }`}
+                        />
+                        {isDistracted && (
+                          <div className="absolute -top-2 -right-2 bg-dark-900 rounded-full p-1.5 border-2 border-neon-red">
+                            {getStatusIcon(currentUser.status)}
+                          </div>
+                        )}
+                      </div>
+                      <div>
+                        <h2 className="text-3xl font-bold text-white mb-1">{currentUser.name}</h2>
+                        <div className={`text-lg font-mono ${
+                          isDistracted ? 'text-neon-red' : 'text-neon-green'
+                        }`}>
+                          {currentUser.status === 'FOCUS' ? 'FLOW STATE' : currentUser.status}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-sm text-gray-400 font-mono mb-1">FLOW SCORE</div>
+                      <div className={`text-5xl font-mono font-bold ${
+                        isDistracted ? 'text-neon-red' : 'text-neon-blue'
+                      }`}>
+                        {Math.floor(currentUser.flowScore)}
+                      </div>
+                    </div>
+                  </div>
+                  
+                  {/* Health/Focus Bar */}
+                  <div className="mb-6">
+                    <div className="flex justify-between text-sm text-gray-400 font-mono mb-2">
+                      <span>FOCUS LEVEL</span>
+                      <span>{Math.floor(currentUser.health)}%</span>
+                    </div>
+                    <div className="w-full bg-gray-900 h-4 rounded-full overflow-hidden">
+                      <div 
+                        className={`h-full transition-all duration-200 ${
+                          isDistracted ? 'bg-neon-red' : 'bg-neon-green'
+                        }`}
+                        style={{ width: `${Math.max(0, currentUser.health)}%` }}
+                      ></div>
+                    </div>
+                  </div>
+
+                  {/* Stats */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="bg-dark-800 rounded-lg p-4">
+                      <div className="text-xs text-gray-400 font-mono mb-1">HEART RATE</div>
+                      <div className={`text-2xl font-mono font-bold ${
+                        currentUser.heartRate > 100 ? 'text-neon-red animate-pulse' : 'text-white'
+                      }`}>
+                        {currentUser.heartRate} BPM
+                      </div>
+                    </div>
+                    <div className="bg-dark-800 rounded-lg p-4">
+                      <div className="text-xs text-gray-400 font-mono mb-1">RANK</div>
+                      <div className="text-2xl font-mono font-bold text-neon-purple">
+                        #{players.filter(p => p.flowScore > currentUser.flowScore).length + 1}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Video Feed */}
+                <div className="absolute bottom-8 right-8 w-72 h-56 bg-black rounded-lg overflow-hidden border-2 border-gray-800 shadow-2xl group">
+                  <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover opacity-80" />
+                  <canvas ref={canvasRef} className="hidden" />
+                  <BiometricHUD data={selfBiometrics} />
+                  <div className="absolute top-2 left-2 bg-black/50 px-2 py-0.5 rounded text-[10px] font-mono text-neon-green border border-neon-green/30">PRESAGE ACTIVE</div>
+                  <div className="absolute bottom-0 left-0 right-0 bg-black/80 p-2 transform translate-y-full group-hover:translate-y-0 transition-transform duration-200">
+                    <div className="text-[9px] text-gray-500 mb-1 font-mono uppercase text-center">Dev: Force Distraction</div>
+                    <div className="flex justify-between gap-1">
+                      <button onClick={() => toggleSimulation('PHONE')} className={`p-1.5 rounded hover:bg-gray-700 ${selfBiometrics.distractionType === 'PHONE' ? 'bg-neon-red text-black' : 'text-gray-400'}`} title="Simulate Phone"><Smartphone size={14} /></button>
+                      <button onClick={() => toggleSimulation('EATING')} className={`p-1.5 rounded hover:bg-gray-700 ${selfBiometrics.distractionType === 'EATING' ? 'bg-neon-red text-black' : 'text-gray-400'}`} title="Simulate Eating"><Coffee size={14} /></button>
+                      <button onClick={() => toggleSimulation('TALKING')} className={`p-1.5 rounded hover:bg-gray-700 ${selfBiometrics.distractionType === 'TALKING' ? 'bg-neon-red text-black' : 'text-gray-400'}`} title="Simulate Talking"><MessageCircle size={14} /></button>
+                      <button onClick={() => toggleSimulation('NO_FACE')} className={`p-1.5 rounded hover:bg-gray-700 ${selfBiometrics.distractionType === 'NO_FACE' ? 'bg-neon-red text-black' : 'text-gray-400'}`} title="Simulate Missing"><UserX size={14} /></button>
+                      <button onClick={() => toggleSimulation('EYES_CLOSED')} className={`p-1.5 rounded hover:bg-gray-700 ${selfBiometrics.distractionType === 'EYES_CLOSED' ? 'bg-neon-red text-black' : 'text-gray-400'}`} title="Simulate Sleep"><EyeOff size={14} /></button>
+                    </div>
+                  </div>
+                </div>
               </div>
-            </div>
-          </div>
+            );
+          })()}
         </div>
         <div className="w-80 border-l border-gray-800 bg-dark-900 p-4">
           <Leaderboard players={players} />
@@ -669,7 +763,7 @@ export default function App() {
             </div>
           </div>
           <div className="text-center mt-12">
-            <button onClick={() => { setGameState(GameState.LOBBY); setWorkContent(''); }} className="px-8 py-3 bg-gray-800 hover:bg-gray-700 text-white rounded-lg font-bold transition-colors flex items-center gap-2 mx-auto">
+            <button onClick={() => { setGameState(GameState.LOBBY); }} className="px-8 py-3 bg-gray-800 hover:bg-gray-700 text-white rounded-lg font-bold transition-colors flex items-center gap-2 mx-auto">
               <RefreshCcw size={18} /> RETURN TO LOBBY
             </button>
           </div>
