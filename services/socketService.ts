@@ -1,92 +1,99 @@
 import { io, Socket } from 'socket.io-client';
-import { DistractionType } from '../types';
+import { BiometricData, DistractionType, Player } from '../types';
 
-type KernelStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
+const SERVER_URL = 'http://localhost:3001';
+const PRESAGE_API_KEY = '2BwfYdU0gG7QXEEi8wIwD1FUgpUWhd3y5A30zGb8';
 
-let socket: Socket | null = null;
-let status: KernelStatus = 'disconnected';
-let statusListeners: Array<(s: KernelStatus) => void> = [];
-let bioListeners: Array<(payload: any) => void> = [];
+class SocketService {
+  private socket: Socket | null = null;
+  private biometricCallback: ((data: Partial<BiometricData>) => void) | null = null;
+  private lobbyCallback: ((players: Player[]) => void) | null = null;
 
-function notifyStatus(newStatus: KernelStatus) {
-  status = newStatus;
-  statusListeners.forEach((cb) => {
-    try { cb(status); } catch {}
-  });
-}
+  connect() {
+    if (this.socket) return;
 
-export function connectKernel(options?: { url?: string; apiKey?: string }) {
-  if (socket && socket.connected) return;
-
-  const url = options?.url || (process.env.KERNEL_URL as string) || 'http://localhost:3001';
-  const apiKey = options?.apiKey || (process.env.PRESAGE_API_KEY as string) || '';
-
-  notifyStatus('connecting');
-  socket = io(url, {
-    transports: ['websocket'],
-    query: { apiKey },
-    reconnection: true,
-    reconnectionAttempts: Infinity,
-    reconnectionDelay: 1000,
-  });
-
-  socket.on('connect', () => {
-    notifyStatus('connected');
-  });
-  socket.on('connect_error', () => {
-    notifyStatus('error');
-  });
-  socket.on('disconnect', () => {
-    notifyStatus('disconnected');
-  });
-
-  socket.on('biometric_update', (payload: any) => {
-    bioListeners.forEach((cb) => {
-      try { cb(payload); } catch {}
+    this.socket = io(SERVER_URL, {
+      transports: ['websocket'],
+      query: {
+        apiKey: PRESAGE_API_KEY, // Authentication for Presage/SmartSpectra Backend
+        clientType: 'FRONTEND'
+      },
+      reconnectionAttempts: 5,
+      timeout: 5000
     });
-  });
-}
 
-export function isKernelConnected(): boolean {
-  return Boolean(socket && socket.connected);
-}
+    this.socket.on('connect', () => {
+      console.log('Connected to Presage Core Backend');
+    });
 
-export function onKernelStatusChange(cb: (status: KernelStatus) => void) {
-  statusListeners.push(cb);
-  return () => {
-    statusListeners = statusListeners.filter((f) => f !== cb);
-  };
-}
+    this.socket.on('biometric_update', (data: any) => {
+      // Expecting backend to send { status: string, heartRate: number, gazeStability: number }
+      if (this.biometricCallback) {
+        this.biometricCallback(this.mapBackendDataToFrontend(data));
+      }
+    });
 
-export function onBiometricUpdate(cb: (payload: any) => void) {
-  bioListeners.push(cb);
-  return () => {
-    bioListeners = bioListeners.filter((f) => f !== cb);
-  };
-}
+    this.socket.on('lobby_state', (players: Player[]) => {
+      if (this.lobbyCallback) {
+        this.lobbyCallback(players);
+      }
+    });
+  }
 
-export function sendFrameToKernel(base64Image: string) {
-  if (!socket || !socket.connected) return;
-  const clean = base64Image.includes(',') ? base64Image.split(',')[1] : base64Image;
-  socket.emit('stream_frame', {
-    timestamp: Date.now(),
-    data: clean,
-  });
-}
+  disconnect() {
+    if (this.socket) {
+      this.socket.disconnect();
+      this.socket = null;
+    }
+  }
 
-export function mapKernelStatusToDistractionType(status: string | undefined): DistractionType {
-  switch (status) {
-    case 'PHONE':
-    case 'EATING':
-    case 'TALKING':
-    case 'EYES_CLOSED':
-    case 'NO_FACE':
-      return status;
-    case 'FOCUS':
-    case 'NONE':
-    default:
-      return 'NONE';
+  // Stream video frame to C++ Backend for analysis
+  sendFrame(base64Frame: string) {
+    if (this.socket?.connected) {
+      // Strip header if present to send raw bytes/string
+      const cleanData = base64Frame.split(',')[1] || base64Frame;
+      this.socket.emit('stream_frame', { 
+        timestamp: Date.now(), 
+        data: cleanData 
+      });
+      return true;
+    }
+    return false;
+  }
+
+  joinLobby(player: Partial<Player>) {
+    this.socket?.emit('join_lobby', player);
+  }
+
+  onBiometricUpdate(cb: (data: Partial<BiometricData>) => void) {
+    this.biometricCallback = cb;
+  }
+
+  onLobbyUpdate(cb: (players: Player[]) => void) {
+    this.lobbyCallback = cb;
+  }
+
+  isConnected(): boolean {
+    return this.socket?.connected || false;
+  }
+
+  private mapBackendDataToFrontend(data: any): Partial<BiometricData> {
+    // Map backend strings to our DistractionType enum
+    let distraction: DistractionType = 'NONE';
+    const status = (data.status || 'FOCUS').toUpperCase();
+    
+    if (status.includes('PHONE')) distraction = 'PHONE';
+    else if (status.includes('EAT')) distraction = 'EATING';
+    else if (status.includes('TALK')) distraction = 'TALKING';
+    else if (status.includes('SLEEP') || status.includes('EYES')) distraction = 'EYES_CLOSED';
+    else if (status.includes('ABSENT') || status.includes('NO_FACE')) distraction = 'NO_FACE';
+    
+    return {
+      heartRate: data.heartRate || 70,
+      gazeStability: data.gazeStability || 100,
+      distractionType: distraction
+    };
   }
 }
 
-
+export const socketService = new SocketService();

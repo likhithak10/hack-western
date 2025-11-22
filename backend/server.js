@@ -5,18 +5,26 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { spawn } = require('child_process');
+const readline = require('readline');
 
 const PORT = Number(process.env.PORT || 3001);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
 const SMART_SPECTRA_PATH = process.env.SMART_SPECTRA_PATH || './path/to/smart_spectra_cli';
 const SMART_SPECTRA_ARGS = (process.env.SMART_SPECTRA_ARGS || '--analyze').split(' ').filter(Boolean);
+const SMART_SPECTRA_MODE = (process.env.SMART_SPECTRA_MODE || 'cli').toLowerCase(); // 'cli' | 'pipeline'
+const SMARTSPECTRA_API_KEY = process.env.SMARTSPECTRA_API_KEY || '';
 
 const app = express();
 const server = http.createServer(app);
 
 // Simple health check
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, mode: 'relay', kernel: Boolean(SMART_SPECTRA_PATH) });
+  res.json({
+    ok: true,
+    mode: 'relay',
+    kernel: Boolean(SMART_SPECTRA_PATH),
+    spectraMode: SMART_SPECTRA_MODE
+  });
 });
 
 // Socket.io for realtime bridge
@@ -27,16 +35,86 @@ const io = new Server(server, {
   }
 });
 
+// -----------------------------
+// Pipeline mode (long-running)
+// -----------------------------
+let pipelineProc = null;
+let lastEmitMs = 0;
+let latestVitals = { status: 'FOCUS', heartRate: null, gazeStability: null };
+
+function startPipelineIfNeeded() {
+  if (SMART_SPECTRA_MODE !== 'pipeline' || pipelineProc) return;
+
+  const args = [...SMART_SPECTRA_ARGS];
+  if (SMARTSPECTRA_API_KEY && args.length === 0) {
+    args.push(SMARTSPECTRA_API_KEY);
+  }
+
+  pipelineProc = spawn(SMART_SPECTRA_PATH, args, {
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  const rl = readline.createInterface({ input: pipelineProc.stdout });
+  rl.on('line', (line) => {
+    // Example line from hello_vitals:
+    // "Vitals - Pulse: 72 BPM, Breathing: 15 BPM"
+    const m = line.match(/Vitals\s*-\s*Pulse:\s*([\d.]+)\s*BPM,\s*Breathing:\s*([\d.]+)\s*BPM/i);
+    if (m) {
+      const pulse = Number(m[1]);
+      latestVitals.heartRate = Number.isFinite(pulse) ? Math.round(pulse) : null;
+      // No direct "gaze" metric; keep stable placeholder
+      latestVitals.gazeStability = latestVitals.gazeStability ?? 95;
+
+      const now = Date.now();
+      if (now - lastEmitMs > 200) {
+        lastEmitMs = now;
+        io.emit('biometric_update', {
+          status: latestVitals.status,
+          heartRate: latestVitals.heartRate,
+          gazeStability: latestVitals.gazeStability
+        });
+      }
+    }
+  });
+
+  pipelineProc.stderr.on('data', (chunk) => {
+    // Optional: log verbose SmartSpectra diagnostics
+    // console.warn('SmartSpectra STDERR:', chunk.toString().trim());
+  });
+
+  pipelineProc.on('close', (code) => {
+    pipelineProc = null;
+    console.warn(`SmartSpectra pipeline exited with code ${code}`);
+    // Do not auto-restart aggressively; allow manual intervention
+  });
+
+  pipelineProc.on('error', (err) => {
+    console.error('Failed to start SmartSpectra pipeline:', err?.message || err);
+    pipelineProc = null;
+  });
+}
+
+startPipelineIfNeeded();
+
 io.on('connection', (socket) => {
   const apiKey = socket.handshake.query?.apiKey;
   console.log(`Client connected: ${socket.id}${apiKey ? ` | Key: ${apiKey}` : ''}`);
 
-  // Drop-oldest queue: only process latest frame to avoid backpressure at 20Hz
-  let isProcessing = false;
-  let latestPending = null;
+  // If in pipeline mode, immediately send last vitals snapshot
+  if (SMART_SPECTRA_MODE === 'pipeline') {
+    socket.emit('biometric_update', {
+      status: latestVitals.status,
+      heartRate: latestVitals.heartRate,
+      gazeStability: latestVitals.gazeStability
+    });
+  }
+
+  // Drop-oldest queue (CLI mode): only process latest frame to avoid backpressure
+  let isProcessing = false; // cli mode only
+  let latestPending = null; // cli mode only
 
   const handleNext = () => {
-    if (!latestPending) return;
+    if (SMART_SPECTRA_MODE !== 'cli' || !latestPending) return;
     const payload = latestPending;
     latestPending = null;
     processFrame(payload)
@@ -45,7 +123,7 @@ io.on('connection', (socket) => {
         socket.emit('biometric_update', { status: 'ERROR', error: 'processing_failed' });
       })
       .finally(() => {
-        if (latestPending) {
+        if (SMART_SPECTRA_MODE === 'cli' && latestPending) {
           // Process the newest pending frame, drop any stale ones
           handleNext();
         } else {
@@ -54,14 +132,16 @@ io.on('connection', (socket) => {
       });
   };
 
-  socket.on('stream_frame', (payload) => {
-    // payload = { timestamp: number, data: base64string }
-    latestPending = payload;
-    if (!isProcessing) {
-      isProcessing = true;
-      handleNext();
-    }
-  });
+  if (SMART_SPECTRA_MODE === 'cli') {
+    socket.on('stream_frame', (payload) => {
+      // payload = { timestamp: number, data: base64string }
+      latestPending = payload;
+      if (!isProcessing) {
+        isProcessing = true;
+        handleNext();
+      }
+    });
+  }
 
   socket.on('disconnect', () => {
     console.log(`Client disconnected: ${socket.id}`);
@@ -71,6 +151,7 @@ io.on('connection', (socket) => {
    * Spawns the SmartSpectra CLI, writes base64 frame to STDIN, and emits parsed result.
    */
   function processFrame(payload) {
+    if (SMART_SPECTRA_MODE !== 'cli') return Promise.resolve();
     return new Promise((resolve, reject) => {
       if (!payload || !payload.data) {
         socket.emit('biometric_update', { status: 'ERROR', error: 'invalid_payload' });

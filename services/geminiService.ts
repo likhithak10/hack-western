@@ -2,7 +2,15 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { VerificationResult, DistractionType } from '../types';
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+let aiClient: GoogleGenAI | null = null;
+function getAiClient(): GoogleGenAI | null {
+  if (aiClient) return aiClient;
+  const key = process.env.API_KEY as string | undefined;
+  if (!key) return null;
+  aiClient = new GoogleGenAI({ apiKey: key });
+  return aiClient;
+}
+const MODEL = (process.env.GEMINI_MODEL as string) || "gemini-2.0-flash-lite";
 
 export const verifyWork = async (workContent: string): Promise<VerificationResult> => {
   if (!workContent || workContent.length < 10) {
@@ -14,8 +22,18 @@ export const verifyWork = async (workContent: string): Promise<VerificationResul
   }
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+    const client = getAiClient();
+    if (!client) {
+      // No API key available — return a deterministic fallback so app continues to function
+      return {
+        verified: true,
+        score: 75,
+        comment: "Verification fallback active (no Gemini API key).",
+      };
+    }
+
+    const response = await client.models.generateContent({
+      model: MODEL,
       contents: `
         You are the referee of a 'Productivity Battle Royale'. 
         Analyze the following text which represents the work a user did during a 25-minute deep work session.
@@ -31,6 +49,10 @@ export const verifyWork = async (workContent: string): Promise<VerificationResul
         """
       `,
       config: {
+        temperature: 0,
+        topK: 1,
+        topP: 0.1,
+        maxOutputTokens: 128,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -70,10 +92,16 @@ export const verifyWork = async (workContent: string): Promise<VerificationResul
 
 export const analyzeUserStatus = async (base64Image: string): Promise<DistractionType> => {
   try {
+    const client = getAiClient();
+    if (!client) {
+      // No API key — treat as focused to avoid blocking gameplay
+      return 'NONE';
+    }
+
     const cleanBase64 = base64Image.split(',')[1] || base64Image;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+    const response = await client.models.generateContent({
+      model: MODEL,
       contents: {
         parts: [
           {
@@ -98,7 +126,7 @@ export const analyzeUserStatus = async (base64Image: string): Promise<Distractio
 
             **PRIORITY 3: STATE CLASSIFICATION**
             - **FOCUS**: User is present and looking at screen OR looking down working.
-            - **EYES_CLOSED**: User is asleep or resting eyes (head usually back or upright). Do NOT trigger this if user is looking down/typing.
+            - **EYES_CLOSED**: Only if eyelids appear fully closed and relaxed in a sustained manner (not a blink, not a downward glance, not low-light). If unsure, prefer 'FOCUS'.
             - **PHONE**: User is holding a phone or looking at a phone.
             - **TALKING**: User is engaging in conversation.
             - **EATING**: User is eating/drinking.
@@ -109,6 +137,10 @@ export const analyzeUserStatus = async (base64Image: string): Promise<Distractio
         ]
       },
       config: {
+        temperature: 0,
+        topK: 1,
+        topP: 0.1,
+        maxOutputTokens: 64,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
