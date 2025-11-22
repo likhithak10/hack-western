@@ -101,12 +101,10 @@ export default function App() {
   useEffect(() => {
     const fetchEscrow = async () => {
       if (wallet.publicKey && wallet.connected) {
-        try {
-          const escrow = await solanaService.fetchEscrowAccount(wallet);
-          setEscrowAccount(escrow);
-        } catch (error) {
-          console.error('Failed to fetch escrow:', error);
-        }
+        // fetchEscrowAccount handles all errors internally and returns null
+        // No need to catch here - it will never throw
+        const escrow = await solanaService.fetchEscrowAccount(wallet);
+        setEscrowAccount(escrow);
       }
     };
     fetchEscrow();
@@ -338,15 +336,23 @@ export default function App() {
     try {
       const stakeAmountLamports = Math.floor(stakeAmount * 1e9); // Convert SOL to lamports
       
-      // Initialize escrow if it doesn't exist
-      if (!escrowAccount) {
-        await solanaService.initializeEscrow(wallet, stakeAmountLamports);
+      // Try to initialize escrow and deposit stake, but don't block game start if it fails
+      try {
+        // Initialize escrow if it doesn't exist
+        if (!escrowAccount) {
+          await solanaService.initializeEscrow(wallet, stakeAmountLamports);
+        }
+        
+        // Deposit stake
+        await solanaService.depositStake(wallet, stakeAmountLamports);
+      } catch (solanaError: any) {
+        // Log Solana error but don't block game start
+        console.warn('Solana transaction failed, starting game anyway:', solanaError);
+        setTxError('Note: Solana transaction failed, but game is starting in demo mode');
+        // Continue to start the game anyway
       }
       
-      // Deposit stake
-      await solanaService.depositStake(wallet, stakeAmountLamports);
-      
-      // Start game
+      // Start game regardless of Solana transaction status
       setPlayers([initializeSelf(), ...initializeBots()]);
       setSessionStartTime(Date.now());
       setGameState(GameState.PLAYING);
@@ -513,7 +519,7 @@ export default function App() {
         )}
         <button 
           onClick={handleStartGame} 
-          disabled={isLoadingTx || stakeAmount <= 0 || stakeAmount > solBalance}
+          disabled={isLoadingTx || stakeAmount <= 0 || (solBalance > 0 && stakeAmount > solBalance)}
           className="w-full mt-8 bg-neon-blue text-black font-bold py-4 rounded-xl hover:bg-white transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {isLoadingTx ? 'Processing...' : 'LOCK IN & START'} <ArrowRight size={20} />

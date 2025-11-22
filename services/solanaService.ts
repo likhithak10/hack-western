@@ -299,30 +299,157 @@ export const forfeitStake = async (
 export const fetchEscrowAccount = async (
   wallet: WalletContextState
 ): Promise<EscrowAccount | null> => {
-  if (!wallet.publicKey) {
-    return null;
-  }
+  // Wrap everything in a promise to catch any unhandled rejections
+  return new Promise(async (resolve) => {
+    try {
+      if (!wallet.publicKey) {
+        resolve(null);
+        return;
+      }
 
-  const program = getProgram(wallet);
-  if (!program) {
-    return null;
-  }
+      const program = getProgram(wallet);
+      if (!program) {
+        resolve(null);
+        return;
+      }
 
-  try {
-    const [escrowPDA] = await getEscrowPDA(wallet.publicKey);
-    const escrowAccount = await program.account.escrow.fetch(escrowPDA);
-    
-    return {
-      user: escrowAccount.user,
-      stakeAmount: escrowAccount.stakeAmount,
-      focusScore: escrowAccount.focusScore,
-      completed: escrowAccount.completed,
-      bump: escrowAccount.bump,
-    };
-  } catch (error) {
-    // Account doesn't exist yet
-    return null;
-  }
+      // Check if PROGRAM_ID is still the placeholder - if so, program isn't deployed
+      const PLACEHOLDER_ID = 'NativeLoader1111111111111111111111111111111';
+      if (PROGRAM_ID.toString() === PLACEHOLDER_ID) {
+        // Program not deployed yet - return null
+        resolve(null);
+        return;
+      }
+
+      const [escrowPDA] = await getEscrowPDA(wallet.publicKey);
+      
+      // Check if account exists and is owned by the program
+      const connection = getConnection();
+      let accountInfo;
+      try {
+        accountInfo = await connection.getAccountInfo(escrowPDA);
+      } catch (e) {
+        resolve(null);
+        return;
+      }
+      
+      if (!accountInfo) {
+        // Account doesn't exist yet
+        resolve(null);
+        return;
+      }
+
+      // Verify the account is owned by our program
+      try {
+        if (!accountInfo.owner.equals(PROGRAM_ID)) {
+          // Account exists but is not owned by our program
+          resolve(null);
+          return;
+        }
+      } catch (e) {
+        resolve(null);
+        return;
+      }
+
+      // Check account data size before deserialization
+      // Escrow account should be: 8 (discriminator) + 32 (user) + 8 (stakeAmount) + 8 (focusScore) + 1 (completed) + 1 (bump) = 58 bytes
+      const expectedSize = 8 + 32 + 8 + 8 + 1 + 1; // 58 bytes
+      if (!accountInfo.data || accountInfo.data.length < expectedSize) {
+        // Account data is too small - not a valid escrow account
+        resolve(null);
+        return;
+      }
+
+      // Check the account discriminator before attempting to decode
+      // This prevents Anchor from trying to decode invalid account data
+      const accountData = accountInfo.data;
+      let discriminatorValid = false;
+      try {
+        // Get the expected discriminator for the Escrow account
+        const discriminator = program.account.escrow.coder.accounts.discriminator('escrow');
+        const accountDiscriminator = accountData.slice(0, 8);
+        
+        // Compare discriminators - if they don't match, this isn't an escrow account
+        discriminatorValid = Buffer.from(discriminator).equals(Buffer.from(accountDiscriminator));
+        if (!discriminatorValid) {
+          // Account exists but doesn't have the correct discriminator
+          resolve(null);
+          return;
+        }
+      } catch (discriminatorError: any) {
+        // Failed to get discriminator or compare - account is likely invalid
+        resolve(null);
+        return;
+      }
+
+      // Only try to decode if discriminator is valid
+      if (!discriminatorValid) {
+        resolve(null);
+        return;
+      }
+
+      // Now try to decode the account - we know it has the correct discriminator
+      // Use a separate promise to catch any errors during decode
+      let escrowAccount;
+      try {
+        // Use setTimeout to ensure this runs in a new tick and errors can be caught
+        escrowAccount = await Promise.resolve(
+          program.account.escrow.coder.accounts.decode('escrow', accountData)
+        ).catch(() => null);
+        
+        if (!escrowAccount) {
+          resolve(null);
+          return;
+        }
+      } catch (decodeError: any) {
+        // Decoding failed - this catches BN deserialization errors
+        resolve(null);
+        return;
+      }
+      
+      // Validate that all required fields exist and are valid
+      try {
+        if (!escrowAccount || 
+            escrowAccount.stakeAmount === undefined || 
+            escrowAccount.stakeAmount === null ||
+            escrowAccount.focusScore === undefined ||
+            escrowAccount.focusScore === null) {
+          // Account exists but has invalid data
+          resolve(null);
+          return;
+        }
+        
+        // Try to access BN methods to verify they're valid BN objects
+        // If this throws, the BN objects are invalid
+        if (typeof escrowAccount.stakeAmount.toNumber !== 'function' ||
+            typeof escrowAccount.focusScore.toNumber !== 'function') {
+          resolve(null);
+          return;
+        }
+      } catch (validationError: any) {
+        // Validation failed - return null
+        resolve(null);
+        return;
+      }
+      
+      try {
+        resolve({
+          user: escrowAccount.user,
+          stakeAmount: escrowAccount.stakeAmount,
+          focusScore: escrowAccount.focusScore,
+          completed: escrowAccount.completed ?? false,
+          bump: escrowAccount.bump ?? 0,
+        });
+      } catch (returnError: any) {
+        // Failed to construct return object
+        resolve(null);
+      }
+    } catch (error: any) {
+      // Catch any other errors (network, etc.) and return null
+      // Don't log these as they're expected for new users or network issues
+      resolve(null);
+    }
+  });
 };
 
 /**

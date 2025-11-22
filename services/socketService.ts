@@ -12,32 +12,49 @@ class SocketService {
   connect() {
     if (this.socket) return;
 
-    this.socket = io(SERVER_URL, {
-      transports: ['websocket'],
-      query: {
-        apiKey: PRESAGE_API_KEY, // Authentication for Presage/SmartSpectra Backend
-        clientType: 'FRONTEND'
-      },
-      reconnectionAttempts: 5,
-      timeout: 5000
-    });
+    try {
+      this.socket = io(SERVER_URL, {
+        transports: ['websocket'],
+        query: {
+          apiKey: PRESAGE_API_KEY, // Authentication for Presage/SmartSpectra Backend
+          clientType: 'FRONTEND'
+        },
+        reconnectionAttempts: 2,
+        timeout: 3000,
+        autoConnect: true,
+        forceNew: false
+      });
 
-    this.socket.on('connect', () => {
-      console.log('Connected to Presage Core Backend');
-    });
+      this.socket.on('connect', () => {
+        console.log('Connected to Presage Core Backend');
+      });
 
-    this.socket.on('biometric_update', (data: any) => {
-      // Expecting backend to send { status: string, heartRate: number, gazeStability: number }
-      if (this.biometricCallback) {
-        this.biometricCallback(this.mapBackendDataToFrontend(data));
-      }
-    });
+      this.socket.on('connect_error', (error: any) => {
+        // Silently handle connection errors - app will use local/mock processing
+        console.warn('Backend server not available, using local processing');
+      });
 
-    this.socket.on('lobby_state', (players: Player[]) => {
-      if (this.lobbyCallback) {
-        this.lobbyCallback(players);
-      }
-    });
+      this.socket.on('disconnect', () => {
+        console.log('Disconnected from backend');
+      });
+
+      this.socket.on('biometric_update', (data: any) => {
+        // Expecting backend to send { status: string, heartRate: number, gazeStability: number }
+        if (this.biometricCallback) {
+          this.biometricCallback(this.mapBackendDataToFrontend(data));
+        }
+      });
+
+      this.socket.on('lobby_state', (players: Player[]) => {
+        if (this.lobbyCallback) {
+          this.lobbyCallback(players);
+        }
+      });
+    } catch (error) {
+      // If socket creation fails, app will use local processing
+      console.warn('Failed to initialize socket connection, using local processing');
+      this.socket = null;
+    }
   }
 
   disconnect() {
@@ -49,14 +66,18 @@ class SocketService {
 
   // Stream video frame to C++ Backend for analysis
   sendFrame(base64Frame: string) {
-    if (this.socket?.connected) {
-      // Strip header if present to send raw bytes/string
-      const cleanData = base64Frame.split(',')[1] || base64Frame;
-      this.socket.emit('stream_frame', { 
-        timestamp: Date.now(), 
-        data: cleanData 
-      });
-      return true;
+    try {
+      if (this.socket?.connected) {
+        // Strip header if present to send raw bytes/string
+        const cleanData = base64Frame.split(',')[1] || base64Frame;
+        this.socket.emit('stream_frame', { 
+          timestamp: Date.now(), 
+          data: cleanData 
+        });
+        return true;
+      }
+    } catch (error) {
+      // Silently fail - app will use local processing
     }
     return false;
   }
