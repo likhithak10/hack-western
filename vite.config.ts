@@ -12,7 +12,9 @@ export default defineConfig(({ mode }) => {
       plugins: [react()],
       define: {
         'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY)
+        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+        'process.env.PRESAGE_API_KEY': JSON.stringify(env.PRESAGE_API_KEY),
+        'process.env.KERNEL_URL': JSON.stringify(env.KERNEL_URL || 'http://localhost:3001')
       },
       resolve: {
         alias: {

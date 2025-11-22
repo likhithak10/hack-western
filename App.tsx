@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { GameState, Player, BiometricData, DistractionType } from './types';
 import { simulateBiometrics, setDistractionOverride, setAIState } from './services/presageMockService';
 import { verifyWork, analyzeUserStatus } from './services/geminiService';
+import { connectKernel, onBiometricUpdate, isKernelConnected, sendFrameToKernel, mapKernelStatusToDistractionType } from './services/socketService';
 import { Leaderboard } from './components/Leaderboard';
 import { BiometricHUD } from './components/BiometricHUD';
 import { ArrowRight, ShieldCheck, Eye, RefreshCcw, Smartphone, Coffee, MessageCircle, UserX, EyeOff, Play, Pause } from 'lucide-react';
@@ -135,6 +136,19 @@ export default function App() {
     return () => clearInterval(interval);
   }, [gameState]);
 
+  // Kernel (SmartSpectra) Link
+  useEffect(() => {
+    if (gameState !== GameState.PLAYING) return;
+    connectKernel();
+    const off = onBiometricUpdate((payload) => {
+      const mapped = mapKernelStatusToDistractionType(payload?.status);
+      setAIState(mapped);
+    });
+    return () => {
+      off();
+    };
+  }, [gameState]);
+
   // Vision Check Loop (Recursive Timeout)
   useEffect(() => {
     if (gameState !== GameState.PLAYING) return;
@@ -164,46 +178,33 @@ export default function App() {
               ctx.drawImage(video, 0, 0, 280, 210);
               const base64 = canvas.toDataURL('image/jpeg', 0.8); 
               
-              // Send to Gemini
-              const result = await analyzeUserStatus(base64);
-              
-              // --- SMOOTHING LOGIC ---
-              // We buffer 'NO_FACE' and 'EYES_CLOSED' to prevent false positives from a single glitchy frame.
-              // 'PHONE' and others are instant.
-              
-              const prev = lastDetectionRef.current;
-              let confirmedState: DistractionType = 'NONE';
-
-              if (result === 'NONE') {
-                // Always forgive immediately if focus returns
-                confirmedState = 'NONE';
-              } else if (result === 'PHONE' || result === 'EATING' || result === 'TALKING') {
-                 // High confidence objects, detect instantly
-                 confirmedState = result;
+              if (isKernelConnected()) {
+                // Kernel path: stream to local SmartSpectra bridge
+                sendFrameToKernel(base64);
+                nextDelay = 120; // ~8Hz when kernel is active
               } else {
-                 // 'NO_FACE' or 'EYES_CLOSED' - prone to error
-                 // Only apply if it matches previous frame (confirmation)
-                 // OR if we were already in this state (sustain)
-                 if (prev === result) {
+                // Cloud path: Gemini Vision
+                const result = await analyzeUserStatus(base64);
+                const prev = lastDetectionRef.current;
+                let confirmedState: DistractionType = 'NONE';
+                if (result === 'NONE') {
+                  confirmedState = 'NONE';
+                } else if (result === 'PHONE' || result === 'EATING' || result === 'TALKING') {
+                  confirmedState = result;
+                } else {
+                  if (prev === result) {
                     confirmedState = result;
-                 } else {
-                    // Keep previous state for one cycle to allow for a blink or glitch
-                    // But if previous was NONE, we stay NONE.
-                    // console.log(`Buffering detection: ${result} (Waiting for confirmation)`);
-                    confirmedState = prev; 
-                 }
-              }
-              
-              setAIState(confirmedState);
-              lastDetectionRef.current = confirmedState === 'NONE' ? result : confirmedState; 
-              
-              // --- ADAPTIVE POLLING ---
-              // If the user is currently penalized (Distracted), poll FASTER to release them ASAP.
-              // If the user is Focused, poll SLOWER to save API quota.
-              if (confirmedState !== 'NONE') {
-                nextDelay = 200; // Very aggressive check to clear penalty (was 600)
-              } else {
-                nextDelay = 500; // Fast monitoring (was 1200)
+                  } else {
+                    confirmedState = prev;
+                  }
+                }
+                setAIState(confirmedState);
+                lastDetectionRef.current = confirmedState === 'NONE' ? result : confirmedState;
+                if (confirmedState !== 'NONE') {
+                  nextDelay = 200;
+                } else {
+                  nextDelay = 500;
+                }
               }
            }
          } catch (e) {
