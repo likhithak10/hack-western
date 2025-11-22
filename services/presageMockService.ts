@@ -1,92 +1,170 @@
 
 import { BiometricData, DistractionType } from '../types';
+import { analyzeUserStatus } from './geminiService';
+import { socketService } from './socketService';
 
-// This simulates the Presage API logic, now driven by Real-Time Gemini Vision
-// API Key Provided in prompt: 2BwfYdU0gG7QXEEi8wIwD1FUgpUWhd3y5A30zGb8
+// PRESAGE ORCHESTRATOR
+// This service routes vision data to either:
+// A) The Remote Backend (C++ SmartSpectra Engine) via WebSockets
+// B) The Local Fallback (Gemini 2.5 Flash) if backend is offline
 
 let currentHeartRate = 70;
 let forcedDistraction: DistractionType = 'NONE'; // Dev Override
-let aiDetectedDistraction: DistractionType = 'NONE'; // Real AI Detection
+let currentDistraction: DistractionType = 'NONE';
+let currentGazeStability = 100;
+let isRemoteActive = false;
+let lastGeminiRunMs = 0;
+const GEMINI_INTERVAL_DISTRACTED_MS = Number((process.env.GEMINI_INTERVAL_DISTRACTED as any) || 100);
+const GEMINI_INTERVAL_FOCUS_MS = Number((process.env.GEMINI_INTERVAL_FOCUS as any) || 180);
+const SMOOTH_EYES_CLOSED_MS = Number((process.env.SMOOTH_EYES_CLOSED_MS as any) || 1200);
+const SMOOTH_NO_FACE_MS = Number((process.env.SMOOTH_NO_FACE_MS as any) || 400);
+const SMOOTH_OTHER_MS = Number((process.env.SMOOTH_OTHER_MS as any) || 250);
+const SMOOTH_RECOVERY_MS = Number((process.env.SMOOTH_RECOVERY_MS as any) || 200);
 
-// Called by the Developer Buttons
+// Local smoothing state (debounce transient misclassifications like blinks)
+let candidateType: DistractionType = 'NONE';
+let candidateSinceMs: number = 0;
+
+// --- Input Handling ---
+
+// 1. Developer Override (Highest Priority)
 export const setDistractionOverride = (type: DistractionType) => {
   forcedDistraction = type;
 };
 
-// Called by the Gemini Vision Loop
-export const setAIState = (type: DistractionType) => {
-  aiDetectedDistraction = type;
+function getThresholdFor(type: DistractionType): number {
+  switch (type) {
+    case 'EYES_CLOSED': return SMOOTH_EYES_CLOSED_MS;
+    case 'NO_FACE': return SMOOTH_NO_FACE_MS;
+    case 'PHONE':
+    case 'EATING':
+    case 'TALKING': return SMOOTH_OTHER_MS;
+    case 'NONE':
+    default: return SMOOTH_RECOVERY_MS;
+  }
+}
+
+function smoothLocalDetection(detected: DistractionType): DistractionType {
+  const now = Date.now();
+  if (detected !== candidateType) {
+    candidateType = detected;
+    candidateSinceMs = now;
+  }
+  const threshold = getThresholdFor(candidateType);
+  const elapsed = now - candidateSinceMs;
+
+  // If already committed to this type, keep it
+  if (currentDistraction === candidateType) return currentDistraction;
+
+  // Commit only after threshold to avoid flicker (blinks -> EYES_CLOSED false positives)
+  if (elapsed >= threshold) {
+    return candidateType;
+  }
+
+  // Not yet stable; keep current
+  return currentDistraction;
+}
+
+// 2. Frame Processing Pipeline
+export const processFrame = async (base64Frame: string): Promise<DistractionType> => {
+  // Attempt to send to backend (for vitals / pipeline)
+  if (!socketService.isConnected()) {
+    socketService.connect();
+  }
+  const sentToSocket = socketService.isConnected() ? (socketService.sendFrame(base64Frame), true) : false;
+  isRemoteActive = sentToSocket;
+
+  // Always compute distraction locally via Gemini:
+  // - pure fallback when remote is not active, or
+  // - blend with remote vitals at an adaptive cadence
+  const now = Date.now();
+  const intervalTarget = currentDistraction === 'NONE' ? GEMINI_INTERVAL_FOCUS_MS : GEMINI_INTERVAL_DISTRACTED_MS;
+  const shouldRunGemini = !isRemoteActive || (now - lastGeminiRunMs) >= intervalTarget;
+
+  if (shouldRunGemini) {
+    lastGeminiRunMs = now;
+    const detected = await analyzeUserStatus(base64Frame);
+    const smoothed = smoothLocalDetection(detected);
+    updateLocalState(smoothed);
+    return smoothed;
+  }
+
+  // Otherwise return current state (recent result from socket or last Gemini)
+  return currentDistraction;
 };
 
-export const simulateBiometrics = (isUserActive: boolean, isTabFocused: boolean): BiometricData => {
-  // 1. Determine Base State Priority: Dev Override > AI Detection > Tab Focus > Default
-  let targetHR = 70;
-  let gazeStability = 100;
+// --- State Management ---
+
+// Initialize Socket Listeners
+socketService.onBiometricUpdate((data: Partial<BiometricData>) => {
+  if (data.distractionType) currentDistraction = data.distractionType as DistractionType;
+  if (typeof data.heartRate === 'number') currentHeartRate = data.heartRate;
+  if (typeof data.gazeStability === 'number') currentGazeStability = data.gazeStability;
+  isRemoteActive = true;
+});
+
+const updateLocalState = (detectedType: DistractionType) => {
+  currentDistraction = detectedType;
   
-  // Decide which distraction is active
+  // Simulate physiological changes for Local Mode since we don't have real sensor data
+  if (detectedType === 'PHONE') {
+    currentGazeStability = 10;
+    currentHeartRate = 110;
+  } else if (detectedType === 'NONE') {
+    currentGazeStability = 95;
+    currentHeartRate = 70;
+  } else {
+    currentGazeStability = 40;
+    currentHeartRate = 85;
+  }
+};
+
+
+// --- Game Loop Integration ---
+
+export const simulateBiometrics = (isUserActive: boolean, isTabFocused: boolean): BiometricData => {
+  // Priority: Dev Override > Real/Gemini State > Tab Focus
+  
   let activeDistraction: DistractionType = 'NONE';
   
   if (forcedDistraction !== 'NONE') {
     activeDistraction = forcedDistraction;
-  } else if (aiDetectedDistraction !== 'NONE') {
-    activeDistraction = aiDetectedDistraction;
+  } else if (currentDistraction !== 'NONE') {
+    activeDistraction = currentDistraction;
   } else if (!isTabFocused) {
-    activeDistraction = 'NO_FACE'; // Assuming if tab hidden, user is effectively gone in this rigorous mode
+    activeDistraction = 'NO_FACE'; 
   }
 
-  let delta = 0.05; // Base gain per tick (100ms)
-
-  // 2. Apply Physics based on Distraction Type
-  switch (activeDistraction) {
-    case 'PHONE':
-      targetHR = 110; // Dopamine/Panic spike
-      gazeStability = 10; // Looking at phone, not screen
-      delta = -1.5; // Heavy penalty
-      break;
-    case 'EATING':
-      targetHR = 85; // Slight elevation
-      gazeStability = 40; // Erratic
-      delta = -0.5; // Medium penalty
-      break;
-    case 'TALKING':
-      targetHR = 95; // Social interaction raises HR
-      gazeStability = 30; // Looking at person
-      delta = -0.8;
-      break;
-    case 'EYES_CLOSED':
-      targetHR = 55; // Drowsy
-      gazeStability = 0;
-      delta = -1.0;
-      break;
-    case 'NO_FACE':
-      targetHR = 70;
-      gazeStability = 0;
-      delta = -2.0; // Immediate penalty for leaving desk
-      break;
-    case 'NONE':
-    default:
-      // Normal Flow State
-      targetHR = isUserActive ? 75 : 65;
-      gazeStability = isUserActive ? 95 : 85;
-      
-      // Micro-glitches (natural movements)
-      if (Math.random() > 0.95) gazeStability -= 15;
-      
-      delta = 0.1; // Flow state building up
-      break;
-  }
-
-  // 3. Smooth Heart Rate Transition (Simulates physiological lag)
-  const approachSpeed = 0.05;
-  currentHeartRate = currentHeartRate + (targetHR - currentHeartRate) * approachSpeed;
+  // Calculate Flow Delta based on Distraction
+  let delta = 0.1;
   
-  // Add physiological noise
-  const noise = (Math.random() - 0.5) * 3; 
-  const finalHR = Math.round(currentHeartRate + noise);
+  switch (activeDistraction) {
+    case 'PHONE': delta = -1.5; break;
+    case 'EATING': delta = -0.5; break;
+    case 'TALKING': delta = -0.8; break;
+    case 'EYES_CLOSED': delta = -1.0; break;
+    case 'NO_FACE': delta = -2.0; break;
+    case 'NONE': delta = 0.1; break;
+  }
+
+  // Physics Smoothing for HR (if locally simulating)
+  // If remote is active, we trust the backend HR completely (don't smooth it)
+  if (!isRemoteActive) {
+    const approachSpeed = 0.05;
+    let targetHR = 70;
+    if (activeDistraction === 'PHONE') targetHR = 110;
+    else if (activeDistraction === 'TALKING') targetHR = 95;
+    else if (activeDistraction === 'EYES_CLOSED') targetHR = 55;
+    
+    currentHeartRate = currentHeartRate + (targetHR - currentHeartRate) * approachSpeed;
+  }
+
+  // Add noise
+  const noise = (Math.random() - 0.5) * (isRemoteActive ? 0 : 3); // No noise if remote (trust sensor)
 
   return {
-    gazeStability,
-    heartRate: finalHR,
+    gazeStability: currentGazeStability,
+    heartRate: Math.round(currentHeartRate + noise),
     distractionType: activeDistraction,
     flowScoreDelta: delta
   };

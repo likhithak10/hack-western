@@ -1,0 +1,3 @@
+/mnt/c/Users/likhi/hack-western/backend/build/CMakeFiles/hello_vitals.dir
+/mnt/c/Users/likhi/hack-western/backend/build/CMakeFiles/edit_cache.dir
+/mnt/c/Users/likhi/hack-western/backend/build/CMakeFiles/rebuild_cache.dir
