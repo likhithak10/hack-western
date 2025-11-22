@@ -1,0 +1,7 @@
+{
+  "name": "Focus Royale",
+  "description": "A high-stakes productivity battle royale where biometrics determine the winner.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
