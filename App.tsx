@@ -1,22 +1,27 @@
 
 import React, { useState, useEffect, useRef } from 'react';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { useWalletModal } from '@solana/wallet-adapter-react-ui';
 import { GameState, Player, BiometricData, DistractionType } from './types';
 import { simulateBiometrics, setDistractionOverride, processFrame } from './services/presageMockService';
 import { verifyWork, analyzeUserStatus } from './services/geminiService';
 import { Leaderboard } from './components/Leaderboard';
 import { BiometricHUD } from './components/BiometricHUD';
-import { ArrowRight, ShieldCheck, Eye, RefreshCcw, Smartphone, Coffee, MessageCircle, UserX, EyeOff, Zap, Cloud } from 'lucide-react';
+import * as solanaService from './services/solanaService';
+import { ArrowRight, ShieldCheck, Eye, RefreshCcw, Smartphone, Coffee, MessageCircle, UserX, EyeOff, Zap, Cloud, Wallet } from 'lucide-react';
 
-const TOTAL_TIME = 25 * 60; // 25 minutes in seconds
 const BOT_NAMES = ["ApexFocus", "DeepWorker99", "FlowState_Chad", "CryptoNomad", "ZenMaster"];
 const UPDATE_MS = 100; // 10hz update rate for animation
-const INITIAL_VISION_DELAY_MS = 200; 
+const INITIAL_VISION_DELAY_MS = 200;
+const FOCUS_SCORE_UPDATE_INTERVAL = 5000; // Update Solana every 5 seconds
+const SESSION_DURATION_MINUTES = 30; // Session ends after 30 minutes or when winner determined 
 
 export default function App() {
+  const wallet = useWallet();
+  const { setVisible } = useWalletModal();
   const [gameState, setGameState] = useState<GameState>(GameState.LOBBY);
-  const [timeLeft, setTimeLeft] = useState(TOTAL_TIME);
-  const [stakeAmount, setStakeAmount] = useState<number>(0.5);
-  const [walletConnected, setWalletConnected] = useState(false);
+  const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
+  const [stakeAmount, setStakeAmount] = useState<number>(0.1);
   const [workContent, setWorkContent] = useState("");
   const [players, setPlayers] = useState<Player[]>([]);
   const [selfBiometrics, setSelfBiometrics] = useState<BiometricData>({
@@ -28,10 +33,15 @@ export default function App() {
   const [verificationResult, setVerificationResult] = useState<{score: number, comment: string} | null>(null);
   const [isProcessingVision, setIsProcessingVision] = useState(false);
   const [usingRemoteBackend, setUsingRemoteBackend] = useState(false);
+  const [solBalance, setSolBalance] = useState<number>(0);
+  const [isLoadingTx, setIsLoadingTx] = useState(false);
+  const [txError, setTxError] = useState<string | null>(null);
+  const [escrowAccount, setEscrowAccount] = useState<solanaService.EscrowAccount | null>(null);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const lastScoreUpdateRef = useRef<number>(0);
   
   // Smoothing Buffer
   const lastDetectionRef = useRef<DistractionType>('NONE');
@@ -70,8 +80,42 @@ export default function App() {
     setUsingRemoteBackend(false);
   }, []);
 
+  // Fetch wallet balance
+  useEffect(() => {
+    const fetchBalance = async () => {
+      if (wallet.publicKey) {
+        try {
+          const balance = await solanaService.getBalance(wallet);
+          setSolBalance(balance);
+        } catch (error) {
+          console.error('Failed to fetch balance:', error);
+        }
+      }
+    };
+    fetchBalance();
+    const interval = setInterval(fetchBalance, 10000); // Update every 10 seconds
+    return () => clearInterval(interval);
+  }, [wallet.publicKey]);
 
-  // Main Game Loop
+  // Fetch escrow account
+  useEffect(() => {
+    const fetchEscrow = async () => {
+      if (wallet.publicKey && wallet.connected) {
+        try {
+          const escrow = await solanaService.fetchEscrowAccount(wallet);
+          setEscrowAccount(escrow);
+        } catch (error) {
+          console.error('Failed to fetch escrow:', error);
+        }
+      }
+    };
+    fetchEscrow();
+    const interval = setInterval(fetchEscrow, 5000); // Update every 5 seconds
+    return () => clearInterval(interval);
+  }, [wallet.publicKey, wallet.connected]);
+
+
+  // Main Game Loop - Focus Score Based
   useEffect(() => {
     if (gameState !== GameState.PLAYING) return;
 
@@ -82,14 +126,21 @@ export default function App() {
       const newBiometrics = simulateBiometrics(true, isTabFocused);
       setSelfBiometrics(newBiometrics);
 
-      // Emit our state to multiplayer server
-      // Removed socketService calls as per edit hint
-
       setPlayers(prevPlayers => {
         return prevPlayers.map(p => {
           if (p.isSelf) {
             const newHealth = Math.min(100, Math.max(0, p.health + (newBiometrics.flowScoreDelta < 0 ? -0.5 : 0.05)));
             const newScore = p.flowScore + newBiometrics.flowScoreDelta;
+            
+            // Update focus score on Solana every FOCUS_SCORE_UPDATE_INTERVAL
+            const now = Date.now();
+            if (now - lastScoreUpdateRef.current > FOCUS_SCORE_UPDATE_INTERVAL && wallet.connected && wallet.publicKey) {
+              lastScoreUpdateRef.current = now;
+              solanaService.updateFocusScore(wallet, newScore).catch(err => {
+                console.error('Failed to update focus score on-chain:', err);
+              });
+            }
+            
             return {
               ...p,
               health: newHealth,
@@ -131,18 +182,18 @@ export default function App() {
         });
       });
 
-      setTimeLeft(prev => {
-        if (prev <= 0.1) {
+      // Check if session should end (30 minutes or winner determined)
+      if (sessionStartTime) {
+        const elapsed = (Date.now() - sessionStartTime) / 1000 / 60; // minutes
+        if (elapsed >= SESSION_DURATION_MINUTES) {
           setGameState(GameState.VERIFYING);
-          return 0;
         }
-        return prev - (UPDATE_MS / 1000);
-      });
+      }
 
     }, UPDATE_MS);
 
     return () => clearInterval(interval);
-  }, [gameState]);
+  }, [gameState, sessionStartTime, wallet]);
 
   // Kernel (SmartSpectra) Link
   useEffect(() => {
@@ -263,22 +314,114 @@ export default function App() {
   }, [gameState]);
 
   // Handlers
+  const handleConnectWallet = () => {
+    setVisible(true);
+  };
+
   const handleJoin = () => {
-    if (!walletConnected) return;
+    if (!wallet.connected) {
+      handleConnectWallet();
+      return;
+    }
     setGameState(GameState.STAKING);
   };
 
-  const handleStartGame = () => {
-    setPlayers([initializeSelf(), ...initializeBots()]);
-    setGameState(GameState.PLAYING);
+  const handleStartGame = async () => {
+    if (!wallet.connected || !wallet.publicKey) {
+      setTxError('Please connect your wallet first');
+      return;
+    }
+
+    setIsLoadingTx(true);
+    setTxError(null);
+
+    try {
+      const stakeAmountLamports = Math.floor(stakeAmount * 1e9); // Convert SOL to lamports
+      
+      // Initialize escrow if it doesn't exist
+      if (!escrowAccount) {
+        await solanaService.initializeEscrow(wallet, stakeAmountLamports);
+      }
+      
+      // Deposit stake
+      await solanaService.depositStake(wallet, stakeAmountLamports);
+      
+      // Start game
+      setPlayers([initializeSelf(), ...initializeBots()]);
+      setSessionStartTime(Date.now());
+      setGameState(GameState.PLAYING);
+    } catch (error: any) {
+      console.error('Failed to start game:', error);
+      setTxError(error.message || 'Transaction failed');
+    } finally {
+      setIsLoadingTx(false);
+    }
   };
 
-  const handleVerify = async () => {
-    setGameState(GameState.VERIFYING);
-    const result = await verifyWork(workContent);
-    setVerificationResult(result);
-    setPlayers(prev => prev.map(p => p.isSelf ? { ...p, flowScore: p.flowScore + (result.score * 2) } : p));
-    setGameState(GameState.RESULTS);
+  const handleEndSession = async () => {
+    if (!wallet.connected || !wallet.publicKey) return;
+
+    setIsLoadingTx(true);
+    setTxError(null);
+
+    try {
+      // Complete session on-chain
+      await solanaService.completeSession(wallet);
+      
+      // Verify work with Gemini
+      setGameState(GameState.VERIFYING);
+      const result = await verifyWork(workContent);
+      setVerificationResult(result);
+      setPlayers(prev => prev.map(p => p.isSelf ? { ...p, flowScore: p.flowScore + (result.score * 2) } : p));
+      setGameState(GameState.RESULTS);
+    } catch (error: any) {
+      console.error('Failed to end session:', error);
+      setTxError(error.message || 'Failed to end session');
+    } finally {
+      setIsLoadingTx(false);
+    }
+  };
+
+  const handleForfeit = async () => {
+    if (!wallet.connected || !wallet.publicKey) return;
+
+    if (!confirm('Are you sure you want to forfeit? You will lose your stake.')) {
+      return;
+    }
+
+    setIsLoadingTx(true);
+    setTxError(null);
+
+    try {
+      await solanaService.forfeitStake(wallet);
+      setGameState(GameState.LOBBY);
+      setWorkContent('');
+    } catch (error: any) {
+      console.error('Failed to forfeit:', error);
+      setTxError(error.message || 'Failed to forfeit stake');
+    } finally {
+      setIsLoadingTx(false);
+    }
+  };
+
+  const handleClaimReward = async () => {
+    if (!wallet.connected || !wallet.publicKey) return;
+
+    setIsLoadingTx(true);
+    setTxError(null);
+
+    try {
+      await solanaService.claimReward(wallet);
+      // Refresh balance
+      const balance = await solanaService.getBalance(wallet);
+      setSolBalance(balance);
+      alert('Reward claimed successfully!');
+    } catch (error: any) {
+      console.error('Failed to claim reward:', error);
+      setTxError(error.message || 'Failed to claim reward');
+    } finally {
+      setIsLoadingTx(false);
+    }
   };
 
   const toggleSimulation = (type: DistractionType) => {
@@ -296,26 +439,48 @@ export default function App() {
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
+  const formatElapsedTime = (startTime: number | null) => {
+    if (!startTime) return '00:00';
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    return formatTime(elapsed);
+  };
+
+  const getTotalPot = () => {
+    return players.length * stakeAmount;
+  };
+
   // Views
   const renderLobby = () => (
     <div className="max-w-2xl mx-auto text-center pt-20 px-4">
       <h1 className="text-6xl font-black text-transparent bg-clip-text bg-gradient-to-r from-neon-green to-neon-blue mb-6 tracking-tighter">FOCUS ROYALE</h1>
-      <p className="text-gray-400 text-xl mb-12 max-w-lg mx-auto">Stake, focus, and let biometrics prove your flow state.</p>
+      <p className="text-gray-400 text-xl mb-12 max-w-lg mx-auto">Stake SOL, compete by focus score. Highest score wins the pot.</p>
       <div className="glass-panel p-8 rounded-2xl mb-8 border border-neon-purple/30 relative overflow-hidden group">
         <div className="relative z-10">
-          <h2 className="text-2xl font-bold mb-4 text-white">Next Lobby Starting In...</h2>
-          <div className="text-5xl font-mono font-bold text-neon-green mb-8">00:45</div>
+          <h2 className="text-2xl font-bold mb-4 text-white">Ready to Compete?</h2>
+          {wallet.connected && wallet.publicKey && (
+            <div className="mb-6 text-left bg-dark-800 p-4 rounded-lg">
+              <div className="text-sm text-gray-400 mb-2">Wallet Address</div>
+              <div className="text-xs font-mono text-neon-green break-all">{wallet.publicKey.toString()}</div>
+              <div className="text-sm text-gray-400 mt-2">Balance: <span className="text-white font-bold">{solBalance.toFixed(4)} SOL</span></div>
+            </div>
+          )}
           <button
-            onClick={() => setWalletConnected(true)}
-            disabled={walletConnected}
-            className={`px-8 py-4 rounded-full font-bold text-lg transition-all transform hover:scale-105 ${walletConnected ? 'bg-gray-800 text-green-400 cursor-default border border-green-500' : 'bg-neon-purple text-white'}`}
+            onClick={handleConnectWallet}
+            disabled={wallet.connected}
+            className={`px-8 py-4 rounded-full font-bold text-lg transition-all transform hover:scale-105 flex items-center gap-2 mx-auto ${wallet.connected ? 'bg-gray-800 text-green-400 cursor-default border border-green-500' : 'bg-neon-purple text-white'}`}
           >
-            {walletConnected ? 'Wallet Connected' : 'Connect Wallet to Enter'}
+            <Wallet size={20} />
+            {wallet.connected ? 'Wallet Connected' : 'Connect Wallet to Enter'}
           </button>
         </div>
       </div>
-      {walletConnected && (
+      {wallet.connected && (
         <button onClick={handleJoin} className="w-full max-w-md mx-auto block px-8 py-4 bg-neon-green text-black font-black text-xl rounded-xl hover:bg-white transition-colors">JOIN LOBBY</button>
+      )}
+      {txError && (
+        <div className="mt-4 p-4 bg-red-900/30 border border-red-500 rounded-lg text-red-400 text-sm">
+          {txError}
+        </div>
       )}
     </div>
   );
@@ -325,14 +490,39 @@ export default function App() {
       <div className="glass-panel p-8 rounded-2xl border border-neon-green/30">
         <ShieldCheck className="w-16 h-16 text-neon-green mx-auto mb-4" />
         <h2 className="text-2xl font-bold text-white mb-2">Stake Your Focus</h2>
-        <p className="text-gray-400 mb-8">Commit funds. Drop below threshold, lose your stake.</p>
+        <p className="text-gray-400 mb-8">Stake SOL. Highest focus score wins the pot.</p>
         <div className="mb-8">
           <label className="block text-left text-sm font-mono text-gray-500 mb-2">AMOUNT (SOL)</label>
-          <input type="number" value={stakeAmount} onChange={(e) => setStakeAmount(parseFloat(e.target.value))} className="w-full bg-dark-900 border border-gray-700 rounded-lg p-4 text-2xl font-mono text-white focus:border-neon-green outline-none" step="0.1" />
+          <input 
+            type="number" 
+            value={stakeAmount} 
+            onChange={(e) => setStakeAmount(parseFloat(e.target.value) || 0)} 
+            className="w-full bg-dark-900 border border-gray-700 rounded-lg p-4 text-2xl font-mono text-white focus:border-neon-green outline-none" 
+            step="0.01" 
+            min="0.01"
+            max={solBalance}
+          />
+          <div className="text-xs text-gray-500 mt-2 text-left">Available: {solBalance.toFixed(4)} SOL</div>
         </div>
-        <button onClick={handleStartGame} className="w-full mt-8 bg-neon-blue text-black font-bold py-4 rounded-xl hover:bg-white transition-colors flex items-center justify-center gap-2">
-          LOCK IN & START <ArrowRight size={20} />
+        {escrowAccount && (
+          <div className="mb-4 p-3 bg-dark-800 rounded-lg text-left">
+            <div className="text-xs text-gray-400 mb-1">Current Escrow</div>
+            <div className="text-sm text-white">Stake: {(escrowAccount.stakeAmount.toNumber() / 1e9).toFixed(4)} SOL</div>
+            <div className="text-sm text-neon-blue">Focus Score: {escrowAccount.focusScore.toNumber()}</div>
+          </div>
+        )}
+        <button 
+          onClick={handleStartGame} 
+          disabled={isLoadingTx || stakeAmount <= 0 || stakeAmount > solBalance}
+          className="w-full mt-8 bg-neon-blue text-black font-bold py-4 rounded-xl hover:bg-white transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {isLoadingTx ? 'Processing...' : 'LOCK IN & START'} <ArrowRight size={20} />
         </button>
+        {txError && (
+          <div className="mt-4 p-3 bg-red-900/30 border border-red-500 rounded-lg text-red-400 text-xs">
+            {txError}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -351,9 +541,14 @@ export default function App() {
             {usingRemoteBackend ? 'KERNEL LINKED' : 'CLOUD MODE'}
           </div>
         </div>
-        <div className="text-4xl font-mono font-bold text-white tracking-widest">{formatTime(timeLeft)}</div>
+        <div className="text-4xl font-mono font-bold text-white tracking-widest">
+          {sessionStartTime ? formatElapsedTime(sessionStartTime) : '00:00'}
+        </div>
         <div className="flex items-center gap-4 text-sm font-mono">
-          <div className="text-neon-purple">POT: {(stakeAmount * 6).toFixed(2)} SOL</div>
+          <div className="text-neon-purple">POT: {getTotalPot().toFixed(2)} SOL</div>
+          {wallet.publicKey && (
+            <div className="text-gray-400">Balance: {solBalance.toFixed(4)} SOL</div>
+          )}
         </div>
       </header>
 
@@ -383,9 +578,27 @@ export default function App() {
         </div>
       </div>
 
-      <div className="fixed bottom-4 left-4">
-        <button onClick={handleVerify} className="bg-gray-800 hover:bg-gray-700 text-white px-4 py-2 rounded text-xs font-mono border border-gray-600">FINISH SESSION EARLY</button>
+      <div className="fixed bottom-4 left-4 flex gap-2">
+        <button 
+          onClick={handleEndSession} 
+          disabled={isLoadingTx}
+          className="bg-neon-green hover:bg-neon-green/80 text-black px-4 py-2 rounded text-xs font-mono border border-neon-green disabled:opacity-50"
+        >
+          {isLoadingTx ? 'Processing...' : 'END SESSION'}
+        </button>
+        <button 
+          onClick={handleForfeit} 
+          disabled={isLoadingTx}
+          className="bg-red-900 hover:bg-red-800 text-white px-4 py-2 rounded text-xs font-mono border border-red-500 disabled:opacity-50"
+        >
+          FORFEIT
+        </button>
       </div>
+      {txError && (
+        <div className="fixed bottom-4 right-4 p-3 bg-red-900/30 border border-red-500 rounded-lg text-red-400 text-xs max-w-sm">
+          {txError}
+        </div>
+      )}
     </div>
   );
 
@@ -435,7 +648,16 @@ export default function App() {
                 <p className="text-gray-400 font-mono text-sm mb-6">Total Flow Score: {Math.floor(winner.flowScore)}</p>
                 <div className="bg-dark-800 rounded-xl p-6 w-full">
                   <div className="text-gray-500 text-sm mb-1">Payout</div>
-                  <div className="text-4xl font-mono font-bold text-neon-green">{(stakeAmount * 6).toFixed(2)} SOL</div>
+                  <div className="text-4xl font-mono font-bold text-neon-green">{getTotalPot().toFixed(2)} SOL</div>
+                  {isWinner && wallet.connected && (
+                    <button
+                      onClick={handleClaimReward}
+                      disabled={isLoadingTx}
+                      className="mt-4 w-full bg-neon-green text-black font-bold py-3 rounded-lg hover:bg-white transition-colors disabled:opacity-50"
+                    >
+                      {isLoadingTx ? 'Claiming...' : 'CLAIM REWARD'}
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
