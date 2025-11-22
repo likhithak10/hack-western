@@ -1,16 +1,17 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { GameState, Player, BiometricData, DistractionType } from './types';
-import { simulateBiometrics, setDistractionOverride, setAIState } from './services/presageMockService';
+import { getBiometrics, setDistractionOverride, setAIState, startPresageMeasurement, processFrameForHeartRate } from './services/presageService';
 import { verifyWork, analyzeUserStatus } from './services/geminiService';
 import { Leaderboard } from './components/Leaderboard';
 import { BiometricHUD } from './components/BiometricHUD';
+import BrainVisualizer from './components/BrainVisualizer';
 import { ArrowRight, ShieldCheck, Eye, RefreshCcw, Smartphone, Coffee, MessageCircle, UserX, EyeOff, Play, Pause } from 'lucide-react';
 
 const TOTAL_TIME = 25 * 60; // 25 minutes in seconds
 const BOT_NAMES = ["ApexFocus", "DeepWorker99", "FlowState_Chad", "CryptoNomad", "ZenMaster"];
 const UPDATE_MS = 100; // 10hz update rate for animation
-const INITIAL_VISION_DELAY_MS = 500; // Start fast
+const INITIAL_VISION_DELAY_MS = 200; // Start very fast for immediate detection
 
 export default function App() {
   const [gameState, setGameState] = useState<GameState>(GameState.LOBBY);
@@ -68,12 +69,11 @@ export default function App() {
   useEffect(() => {
     if (gameState !== GameState.PLAYING) return;
 
-    const interval = setInterval(() => {
+    const interval = setInterval(async () => {
       // 1. Update Self (Physics & State)
       const isTabFocused = document.visibilityState === 'visible';
       // Note: simulateBiometrics now pulls from the shared state which is updated by the Vision Loop
-      const newBiometrics = simulateBiometrics(true, isTabFocused);
-      setSelfBiometrics(newBiometrics);
+      const newBiometrics = await getBiometrics(true, isTabFocused);
 
       setPlayers(prevPlayers => {
         return prevPlayers.map(p => {
@@ -157,19 +157,24 @@ export default function App() {
            const ctx = canvas.getContext('2d');
            
            if (ctx && video.videoWidth > 0) {
-              // Optimization: Lower resolution for faster upload & inference
-              canvas.width = 280; 
-              canvas.height = 210;
-              // 0.8 quality is sufficient for detection
-              ctx.drawImage(video, 0, 0, 280, 210);
-              const base64 = canvas.toDataURL('image/jpeg', 0.8); 
+              // Higher resolution for better detection (especially for mouth/eyes)
+              canvas.width = 640; 
+              canvas.height = 480;
+              // Higher quality for better detection
+              ctx.drawImage(video, 0, 0, 640, 480);
+              const base64 = canvas.toDataURL('image/jpeg', 0.9); 
               
-              // Send to Gemini
+              // Send to Gemini for distraction detection
+              // Also send frame to Presage for heart rate detection (async, don't wait)
+              processFrameForHeartRate(base64, Date.now()).catch(err => {
+                console.error('Presage heart rate processing error:', err);
+              });
+              
               const result = await analyzeUserStatus(base64);
               
               // --- SMOOTHING LOGIC ---
               // We buffer 'NO_FACE' and 'EYES_CLOSED' to prevent false positives from a single glitchy frame.
-              // 'PHONE' and others are instant.
+              // 'PHONE', 'EATING', and 'TALKING' are instant (high confidence).
               
               const prev = lastDetectionRef.current;
               let confirmedState: DistractionType = 'NONE';
@@ -180,30 +185,47 @@ export default function App() {
               } else if (result === 'PHONE' || result === 'EATING' || result === 'TALKING') {
                  // High confidence objects, detect instantly
                  confirmedState = result;
+                 // Debug logging
+                 if (result === 'TALKING') {
+                   console.log('✅ TALKING confirmed and set');
+                 } else if (result === 'EATING') {
+                   console.log('✅ EATING confirmed and set');
+                 }
+              } else if (result === 'EYES_CLOSED') {
+                 // Eyes closed - faster confirmation (only need 1-2 frames)
+                 // If we see it once and it's sustained, or if we were already in this state, confirm it
+                 if (prev === 'EYES_CLOSED') {
+                    confirmedState = result;
+                    console.log('✅ EYES_CLOSED confirmed (sustained)');
+                 } else {
+                    // First detection - apply immediately but will need next frame to sustain
+                    confirmedState = result;
+                    console.log('⏳ EYES_CLOSED detected, applying immediately');
+                 }
               } else {
-                 // 'NO_FACE' or 'EYES_CLOSED' - prone to error
-                 // Only apply if it matches previous frame (confirmation)
-                 // OR if we were already in this state (sustain)
+                 // 'NO_FACE' - prone to error, needs confirmation
                  if (prev === result) {
                     confirmedState = result;
                  } else {
-                    // Keep previous state for one cycle to allow for a blink or glitch
-                    // But if previous was NONE, we stay NONE.
-                    // console.log(`Buffering detection: ${result} (Waiting for confirmation)`);
-                    confirmedState = prev; 
+                    confirmedState = prev || 'NONE';
                  }
               }
               
               setAIState(confirmedState);
-              lastDetectionRef.current = confirmedState === 'NONE' ? result : confirmedState; 
+              lastDetectionRef.current = confirmedState === 'NONE' ? result : confirmedState;
+              
+              // Log state changes
+              if (confirmedState !== prev && confirmedState !== 'NONE') {
+                console.log(`🔄 State changed: ${prev} → ${confirmedState}`);
+              } 
               
               // --- ADAPTIVE POLLING ---
               // If the user is currently penalized (Distracted), poll FASTER to release them ASAP.
               // If the user is Focused, poll SLOWER to save API quota.
               if (confirmedState !== 'NONE') {
-                nextDelay = 200; // Very aggressive check to clear penalty (was 600)
+                nextDelay = 150; // Very aggressive check to clear penalty - faster response
               } else {
-                nextDelay = 500; // Fast monitoring (was 1200)
+                nextDelay = 300; // Fast monitoring - detect changes quickly
               }
            }
          } catch (e) {
@@ -264,6 +286,7 @@ export default function App() {
   };
 
   const handleStartGame = () => {
+    startPresageMeasurement(); // Initialize Presage heart rate detection
     setPlayers([initializeSelf(), ...initializeBots()]);
     setGameState(GameState.PLAYING);
   };
@@ -406,19 +429,19 @@ export default function App() {
       </header>
 
       <div className="flex-1 flex overflow-hidden">
+        {/* Brain Visualizer - Center */}
         <div className="flex-1 bg-dark-900 relative flex flex-col">
-          <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-neon-green to-transparent opacity-50"></div>
-          
-          <textarea
-            className="flex-1 bg-transparent p-8 text-gray-300 text-lg font-mono outline-none resize-none leading-relaxed"
-            placeholder="// Start your deep work here. Paste code, write essays, or plan strategies. Presage is watching..."
-            value={workContent}
-            onChange={(e) => setWorkContent(e.target.value)}
-            spellCheck={false}
-          />
+          <div className="p-4 border-b border-gray-800">
+            <h3 className="text-neon-purple font-bold text-sm font-mono uppercase tracking-wider flex items-center gap-2">
+              <Eye size={16} /> Brain Activity
+            </h3>
+          </div>
+          <div className="flex-1 relative">
+            <BrainVisualizer biometrics={selfBiometrics} className="absolute inset-0" />
+          </div>
 
           {/* Self Camera Preview */}
-          <div className="absolute bottom-8 right-8 w-72 h-56 bg-black rounded-lg overflow-hidden border-2 border-gray-800 shadow-2xl group">
+          <div className="absolute bottom-8 right-8 w-72 h-56 bg-black rounded-lg overflow-hidden border-2 border-gray-800 shadow-2xl group z-10">
              <video 
                 ref={videoRef} 
                 autoPlay 

@@ -2,7 +2,18 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { VerificationResult, DistractionType } from '../types';
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Get API key from environment (Vite uses import.meta.env, but we also define process.env in vite.config)
+const apiKey = (import.meta.env?.GEMINI_API_KEY || 
+                import.meta.env?.VITE_GEMINI_API_KEY || 
+                (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) ||
+                (typeof process !== 'undefined' && process.env?.API_KEY) ||
+                '').trim();
+
+if (!apiKey) {
+  console.warn('⚠️ GEMINI_API_KEY not found in environment variables');
+}
+
+const ai = new GoogleGenAI({ apiKey });
 
 export const verifyWork = async (workContent: string): Promise<VerificationResult> => {
   if (!workContent || workContent.length < 10) {
@@ -84,26 +95,43 @@ export const analyzeUserStatus = async (base64Image: string): Promise<Distractio
           },
           {
             text: `
-            Analyze this webcam frame for a "Focus Royale" game to detect user presence and attention.
-            
-            **PRIORITY 1: PRESENCE DETECTION (NO_FACE)**
-            - **CRITICAL**: If the chair is empty, or the user has walked away, or the room is too dark to see a face, you MUST return 'NO_FACE'.
-            - If you only see a background, wall, or furniture -> 'NO_FACE'.
-            - If the face is severely cropped or not visible -> 'NO_FACE'.
-            
-            **PRIORITY 2: HEAD ORIENTATION**
-            - **LOOKING_DOWN**: User is looking down at keyboard/notebook. This is productive work.
-            - **FACING_SCREEN**: User is looking at the monitor.
-            - **ABSENT**: No user found.
+            You are analyzing a webcam frame for a productivity monitoring app. Your job is to detect specific user behaviors.
 
-            **PRIORITY 3: STATE CLASSIFICATION**
-            - **FOCUS**: User is present and looking at screen OR looking down working.
-            - **EYES_CLOSED**: User is asleep or resting eyes (head usually back or upright). Do NOT trigger this if user is looking down/typing.
-            - **PHONE**: User is holding a phone or looking at a phone.
-            - **TALKING**: User is engaging in conversation.
-            - **EATING**: User is eating/drinking.
+            **DETECTION RULES (in priority order):**
 
-            Return a JSON object based on these rules.
+            1. **NO_FACE**: Return this ONLY if:
+               - No human face is visible
+               - The chair/desk is empty
+               - The room is too dark to see a face
+               - Face is severely cropped or obscured
+
+            2. **TALKING**: Return this if you see ANY of these:
+               - Mouth is OPEN (lips parted, visible gap between lips)
+               - Mouth is MOVING (lips forming words, speaking motion)
+               - User appears to be speaking (even if looking at screen)
+               - Head turned as if talking to someone
+               - Clear speaking/verbal communication indicators
+               **BE AGGRESSIVE**: If mouth is open, assume TALKING unless clearly eating.
+
+            3. **EYES_CLOSED**: Return this if:
+               - Eyes are completely closed (eyelids covering eyes)
+               - Eyes are mostly closed (only slits visible)
+               - User appears to be sleeping or resting with eyes shut
+               **IMPORTANT**: Do NOT return this if user is just looking down at keyboard - only if eyes are actually closed.
+
+            4. **PHONE**: User is holding or looking at a phone/device.
+
+            5. **EATING**: User is eating/drinking (food visible, hand bringing food to mouth).
+
+            6. **FOCUS**: User is present, eyes open, not talking, not on phone, not eating - actively working.
+
+            **CRITICAL INSTRUCTIONS:**
+            - Be CONFIDENT in your detections - if you see mouth open, return TALKING
+            - If you see eyes closed, return EYES_CLOSED
+            - Don't be overly conservative - detect what you actually see
+            - Return the MOST DISTRACTING state if multiple apply (TALKING > EATING > PHONE > EYES_CLOSED > FOCUS)
+
+            Analyze the image and return the appropriate status.
             `
           }
         ]
@@ -125,7 +153,7 @@ export const analyzeUserStatus = async (base64Image: string): Promise<Distractio
             status: {
               type: Type.STRING,
               enum: ['PHONE', 'EATING', 'EYES_CLOSED', 'TALKING', 'NO_FACE', 'FOCUS'],
-              description: "The final classification of the user's behavior."
+              description: "The final classification. Be confident: if mouth is open = TALKING, if eyes are closed = EYES_CLOSED, if face not visible = NO_FACE, otherwise FOCUS."
             }
           },
           required: ["faceVisible", "headOrientation", "status"]
@@ -135,20 +163,41 @@ export const analyzeUserStatus = async (base64Image: string): Promise<Distractio
 
     const result = JSON.parse(response.text || "{}");
     
+    // Debug logging
+    console.log('🔍 Gemini Detection Result:', {
+      faceVisible: result.faceVisible,
+      headOrientation: result.headOrientation,
+      status: result.status
+    });
+    
     // 1. Strict Enforcement of NO_FACE
     if (result.faceVisible === false || result.headOrientation === 'ABSENT' || result.status === 'NO_FACE') {
+      console.log('❌ NO_FACE detected');
       return 'NO_FACE';
     }
 
     // 2. Fix "Looking Down = Eyes Closed" false positive
     // If the model thinks eyes are closed but the user is looking down (working), override to FOCUS.
     if (result.status === 'EYES_CLOSED' && result.headOrientation === 'LOOKING_DOWN') {
+      console.log('👀 Eyes closed but looking down - treating as FOCUS (working)');
       return 'NONE'; // Maps to FOCUS
     }
 
     // 3. Map API status to App DistractionType
     const status = result.status as DistractionType | 'FOCUS';
-    if (status === 'FOCUS') return 'NONE';
+    
+    if (status === 'FOCUS') {
+      return 'NONE';
+    }
+    
+    // Log important detections with emphasis
+    if (status === 'TALKING') {
+      console.log('🎤🎤🎤 TALKING DETECTED BY GEMINI 🎤🎤🎤');
+    } else if (status === 'EYES_CLOSED') {
+      console.log('😴😴😴 EYES_CLOSED DETECTED BY GEMINI 😴😴😴');
+    } else {
+      console.log(`📊 Detected: ${status}`);
+    }
     
     return status as DistractionType;
 
