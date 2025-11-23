@@ -50,6 +50,7 @@
         background: rgba(19, 19, 31, 0.7);
         backdrop-filter: blur(12px);
         border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.05);
       }
       /* Custom Scrollbar */
       ::-webkit-scrollbar {
@@ -64,6 +65,91 @@
       }
       ::-webkit-scrollbar-thumb:hover {
         background: #00ff9d;
+      }
+      /* Sleek landing visuals */
+      .bg-grid-sleek {
+        background-image:
+          linear-gradient(rgba(188, 19, 254, 0.12) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(0, 217, 255, 0.10) 1px, transparent 1px);
+        background-size: 30px 30px, 30px 30px;
+        background-position: center;
+      }
+      .grid-dots {
+        position: absolute;
+        inset: 0;
+        background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px);
+        background-size: 18px 18px;
+        opacity: 0.18;
+        mask-image: radial-gradient(ellipse at 50% 30%, rgba(0,0,0,0.9), rgba(0,0,0,0.4) 55%, transparent 75%);
+        -webkit-mask-image: radial-gradient(ellipse at 50% 30%, rgba(0,0,0,0.9), rgba(0,0,0,0.4) 55%, transparent 75%);
+        pointer-events: none;
+      }
+      .hero-aurora {
+        position: absolute;
+        inset: -20%;
+        pointer-events: none;
+        background:
+          radial-gradient(600px 400px at 12% 18%, rgba(188, 19, 254, 0.22), transparent 40%),
+          radial-gradient(700px 500px at 88% 12%, rgba(0, 217, 255, 0.18), transparent 40%),
+          radial-gradient(800px 600px at 50% 85%, rgba(0, 255, 157, 0.16), transparent 35%);
+        filter: blur(40px);
+        opacity: 0.7;
+        z-index: -1;
+      }
+      .decor-layer { position: absolute; inset: 0; pointer-events: none; z-index: -1; }
+      .orb {
+        position: absolute;
+        border-radius: 9999px;
+        filter: blur(40px);
+        opacity: 0.35;
+      }
+      .orb--lg { width: 44vw; height: 44vw; }
+      .orb--md { width: 32vw; height: 32vw; }
+      .orb--purple { background: radial-gradient(closest-side, rgba(188,19,254,.35), transparent 60%); }
+      .orb--blue   { background: radial-gradient(closest-side, rgba(0,217,255,.28), transparent 60%); }
+      .orb--green  { background: radial-gradient(closest-side, rgba(0,255,157,.25), transparent 60%); }
+      .orb--float  { animation: floaty 12s ease-in-out infinite; }
+      .animated-border {
+        position: relative;
+        padding: 1px;
+        border-radius: 22px;
+        background: linear-gradient(120deg, rgba(188, 19, 254, 0.7), rgba(0, 217, 255, 0.7), rgba(0, 255, 157, 0.7));
+        background-size: 200% 200%;
+        animation: moveGradient 8s ease infinite;
+      }
+      .animated-border > .content {
+        border-radius: 21px;
+      }
+      .btn-neo {
+        background-image: linear-gradient(90deg, #bc13fe, #00d9ff 55%, #00ff9d);
+        color: #020305;
+        box-shadow:
+          0 12px 40px rgba(188, 19, 254, 0.25),
+          0 12px 40px rgba(0, 217, 255, 0.18),
+          inset 0 -2px 0 rgba(0, 0, 0, 0.4);
+        transition: transform 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease;
+      }
+      .btn-neo:hover {
+        transform: translateY(-1px) scale(1.02);
+        filter: saturate(1.2);
+        box-shadow:
+          0 16px 60px rgba(188, 19, 254, 0.35),
+          0 16px 60px rgba(0, 217, 255, 0.25),
+          inset 0 -2px 0 rgba(0, 0, 0, 0.4);
+      }
+      .pill {
+        background: rgba(188, 19, 254, 0.1);
+        border: 1px solid rgba(188, 19, 254, 0.4);
+        box-shadow: 0 0 0 1px rgba(0, 217, 255, 0.15) inset;
+      }
+      @keyframes moveGradient {
+        0% { background-position: 0% 50%; }
+        50% { background-position: 100% 50%; }
+        100% { background-position: 0% 50%; }
+      }
+      @keyframes floaty {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-14px); }
       }
     </style>
   <script type="importmap">

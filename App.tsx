@@ -10,11 +10,12 @@ import { BiometricHUD } from './components/BiometricHUD';
 import * as solanaService from './services/solanaService';
 import { ArrowRight, ShieldCheck, Eye, RefreshCcw, Smartphone, Coffee, MessageCircle, UserX, EyeOff, Wallet } from 'lucide-react';
 
-const BOT_NAMES = ["ApexFocus", "DeepWorker99", "FlowState_Chad", "CryptoNomad", "ZenMaster"];
+const BOT_NAMES = ["Likhitha", "Sophie", "Michelle", "Aiden", "Chahana"];
 const UPDATE_MS = 100; // 10hz update rate for animation
 const INITIAL_VISION_DELAY_MS = 200;
 const FOCUS_SCORE_UPDATE_INTERVAL = 5000; // Update Solana every 5 seconds
-const SESSION_DURATION_MINUTES = 30; // Session ends after 30 minutes or when winner determined 
+const SESSION_DURATION_MINUTES = 1; // Minimum session is one minute (testing)
+const DISTRACTION_PENALTY_RATE = 0.2; // Simulated: distracted players lose 20% of stake to the winner
 
 export default function App() {
   const wallet = useWallet();
@@ -36,6 +37,8 @@ export default function App() {
   const [isLoadingTx, setIsLoadingTx] = useState(false);
   const [txError, setTxError] = useState<string | null>(null);
   const [escrowAccount, setEscrowAccount] = useState<solanaService.EscrowAccount | null>(null);
+  const [penalties, setPenalties] = useState<Record<string, number>>({});
+  const [payouts, setPayouts] = useState<Record<string, number> | null>(null);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -71,6 +74,45 @@ export default function App() {
     status: 'FOCUS',
     heartRate: 70
   });
+
+  // --- Simulated Payouts ---
+  const computePayouts = (finalPlayers: Player[], perPlayerStake: number): Record<string, number> => {
+    const distribution: Record<string, number> = {};
+    if (!finalPlayers.length) return distribution;
+    const winner = [...finalPlayers].sort((a, b) => b.flowScore - a.flowScore)[0];
+    let penaltyPool = 0;
+    for (const p of finalPlayers) {
+      const isDistracted = p.status !== 'FOCUS';
+      if (p.id === winner.id) {
+        distribution[p.id] = perPlayerStake; // base; add penalties after loop
+      } else if (isDistracted) {
+        const penalty = perPlayerStake * DISTRACTION_PENALTY_RATE;
+        distribution[p.id] = Math.max(0, perPlayerStake - penalty);
+        penaltyPool += penalty;
+      } else {
+        distribution[p.id] = perPlayerStake;
+      }
+    }
+    distribution[winner.id] = (distribution[winner.id] || 0) + penaltyPool;
+    return distribution;
+  };
+  
+  // Simulated payouts from accumulated distracted time penalties over the entire session.
+  const computePayoutsFromPenalties = (finalPlayers: Player[], perPlayerStake: number, penaltyByPlayer: Record<string, number>): Record<string, number> => {
+    const distribution: Record<string, number> = {};
+    if (!finalPlayers.length) return distribution;
+    const topScore = Math.max(...finalPlayers.map(p => p.flowScore));
+    const winners = finalPlayers.filter(p => p.flowScore === topScore);
+    const totalPenaltyPool = finalPlayers.reduce((sum, p) => sum + Math.min(perPlayerStake, penaltyByPlayer[p.id] || 0), 0);
+    const bonusPerWinner = winners.length > 0 ? totalPenaltyPool / winners.length : 0;
+    for (const p of finalPlayers) {
+      const lost = Math.min(perPlayerStake, penaltyByPlayer[p.id] || 0);
+      const base = Math.max(0, perPlayerStake - lost);
+      const bonus = winners.find(w => w.id === p.id) ? bonusPerWinner : 0;
+      distribution[p.id] = base + bonus;
+    }
+    return distribution;
+  };
 
   // --- Effects ---
 
@@ -118,6 +160,7 @@ export default function App() {
 
     const interval = setInterval(() => {
       const isTabFocused = document.visibilityState === 'visible';
+      const distractedMap: Record<string, boolean> = {};
       
       // Get physics state (Remote or Local)
       const newBiometrics = simulateBiometrics(true, isTabFocused);
@@ -138,12 +181,14 @@ export default function App() {
               });
             }
             
+            const newStatusVal = newBiometrics.distractionType === 'NONE' ? 'FOCUS' : newBiometrics.distractionType;
+            distractedMap[p.id] = newStatusVal !== 'FOCUS';
             return {
               ...p,
               health: newHealth,
               flowScore: newScore,
               heartRate: newBiometrics.heartRate,
-              status: newBiometrics.distractionType === 'NONE' ? 'FOCUS' : newBiometrics.distractionType
+              status: newStatusVal
             };
           } else {
             // Bot Simulation Logic
@@ -168,6 +213,7 @@ export default function App() {
 
             const healthChange = scoreDelta < 0 ? -0.5 : 0.05;
 
+            distractedMap[p.id] = currentStatus !== 'FOCUS';
             return {
               ...p,
               flowScore: p.flowScore + scoreDelta,
@@ -179,13 +225,20 @@ export default function App() {
         });
       });
 
-      // Check if session should end (30 minutes or winner determined)
-      if (sessionStartTime) {
-        const elapsed = (Date.now() - sessionStartTime) / 1000 / 60; // minutes
-        if (elapsed >= SESSION_DURATION_MINUTES) {
-          setGameState(GameState.VERIFYING);
+      // Accumulate distraction penalties for the current tick
+      const penaltyPerMs = stakeAmount / (SESSION_DURATION_MINUTES * 60 * 1000);
+      const increment = penaltyPerMs * UPDATE_MS;
+      setPenalties(prev => {
+        const next: Record<string, number> = { ...prev };
+        for (const id in distractedMap) {
+          const wasDistracted = distractedMap[id];
+          const current = next[id] || 0;
+          next[id] = wasDistracted ? Math.min(stakeAmount, current + increment) : current;
         }
-      }
+        return next;
+      });
+
+      // We no longer auto-transition to a VERIFYING screen; user ends session via button.
 
     }, UPDATE_MS);
 
@@ -333,35 +386,13 @@ export default function App() {
     setTxError(null);
 
     try {
-      const stakeAmountLamports = Math.floor(stakeAmount * 1e9); // Convert SOL to lamports
-      
-      // Try to initialize escrow and deposit stake, but don't block game start if it fails
-      // Check if Solana program is deployed first
-      const PLACEHOLDER_PROGRAM_ID = 'NativeLoader1111111111111111111111111111111';
-      const isProgramDeployed = solanaService.PROGRAM_ID.toString() !== PLACEHOLDER_PROGRAM_ID;
-      
-      if (isProgramDeployed) {
-        try {
-          // Initialize escrow if it doesn't exist
-          if (!escrowAccount) {
-            await solanaService.initializeEscrow(wallet, stakeAmountLamports);
-          }
-          
-          // Deposit stake
-          await solanaService.depositStake(wallet, stakeAmountLamports);
-        } catch (solanaError: any) {
-          // Log Solana error but don't block game start
-          console.warn('Solana transaction failed, starting game anyway:', solanaError);
-          setTxError('Note: Solana features unavailable, but game is starting in demo mode');
-          // Continue to start the game anyway
-        }
-      } else {
-        // Program not deployed - this is expected for demo mode
-        console.log('Solana program not deployed - running in demo mode');
-      }
-      
-      // Start game regardless of Solana transaction status
-      setPlayers([initializeSelf(), ...initializeBots()]);
+      // Start game (simulation-only, no on-chain dependency)
+      const initialPlayers = [initializeSelf(), ...initializeBots()];
+      setPlayers(initialPlayers);
+      // Reset penalties tracking
+      const zeroPenalties: Record<string, number> = {};
+      initialPlayers.forEach(p => { zeroPenalties[p.id] = 0; });
+      setPenalties(zeroPenalties);
       setSessionStartTime(Date.now());
       setGameState(GameState.PLAYING);
     } catch (error: any) {
@@ -373,20 +404,28 @@ export default function App() {
   };
 
   const handleEndSession = async () => {
-    if (!wallet.connected || !wallet.publicKey) return;
+    // Allow ending session without wallet
+    if (isLoadingTx) return;
 
     setIsLoadingTx(true);
     setTxError(null);
 
     try {
-      // Complete session on-chain
-      await solanaService.completeSession(wallet);
-      
-      // Verify work with Gemini
-      setGameState(GameState.VERIFYING);
-      const result = await verifyWork('');
-      setVerificationResult(result);
-      setPlayers(prev => prev.map(p => p.isSelf ? { ...p, flowScore: p.flowScore + (result.score * 2) } : p));
+      // Enforce minimum session duration of one hour
+      if (sessionStartTime) {
+        const elapsedMs = Date.now() - sessionStartTime;
+        const minSessionMs = SESSION_DURATION_MINUTES * 60 * 1000;
+        if (elapsedMs < minSessionMs) {
+          setTxError('Minimum session is one minute (testing).');
+          setIsLoadingTx(false);
+          return;
+        }
+      }
+      // Compute simulated payouts from accumulated distraction penalties and go straight to results
+      const finalPlayers = [...players];
+      const finalPayouts = computePayoutsFromPenalties(finalPlayers, stakeAmount, penalties);
+      setPayouts(finalPayouts);
+      setVerificationResult(null);
       setGameState(GameState.RESULTS);
     } catch (error: any) {
       console.error('Failed to end session:', error);
@@ -464,38 +503,74 @@ export default function App() {
 
   // Views
   const renderLobby = () => (
-    <div className="max-w-2xl mx-auto text-center pt-20 px-4">
-      <h1 className="text-6xl font-black text-transparent bg-clip-text bg-gradient-to-r from-neon-green to-neon-blue mb-6 tracking-tighter">FOCUS ROYALE</h1>
-      <p className="text-gray-400 text-xl mb-12 max-w-lg mx-auto">Stake SOL, compete by focus score. Highest score wins the pot.</p>
-      <div className="glass-panel p-8 rounded-2xl mb-8 border border-neon-purple/30 relative overflow-hidden group">
-        <div className="relative z-10">
-          <h2 className="text-2xl font-bold mb-4 text-white">Ready to Compete?</h2>
-          {wallet.connected && wallet.publicKey && (
-            <div className="mb-6 text-left bg-dark-800 p-4 rounded-lg">
-              <div className="text-sm text-gray-400 mb-2">Wallet Address</div>
-              <div className="text-xs font-mono text-neon-green break-all">{wallet.publicKey.toString()}</div>
-              <div className="text-sm text-gray-400 mt-2">Balance: <span className="text-white font-bold">{solBalance.toFixed(4)} SOL</span></div>
-            </div>
-          )}
-          <button
-            onClick={handleConnectWallet}
-            disabled={wallet.connected}
-            className={`px-8 py-4 rounded-full font-bold text-lg transition-all transform hover:scale-105 flex items-center gap-2 mx-auto ${wallet.connected ? 'bg-gray-800 text-green-400 cursor-default border border-green-500' : 'bg-neon-purple text-white'}`}
-          >
-            <Wallet size={20} />
-            {wallet.connected ? 'Wallet Connected' : 'Connect Wallet to Enter'}
-          </button>
-        </div>
+    <section className="relative overflow-hidden pt-20 pb-16 min-h-screen">
+      <div className="absolute inset-0 bg-grid-sleek opacity-70"></div>
+      <div className="grid-dots"></div>
+      <div className="hero-aurora"></div>
+      <div className="decor-layer">
+        <div className="orb orb--lg orb--purple orb--float" style={{ bottom: '-10vh', left: '-10vw' }}></div>
+        <div className="orb orb--md orb--blue" style={{ top: '18vh', right: '-8vw' }}></div>
+        <div className="orb orb--md orb--green orb--float" style={{ bottom: '6vh', right: '6vw' }}></div>
       </div>
-      {wallet.connected && (
-        <button onClick={handleJoin} className="w-full max-w-md mx-auto block px-8 py-4 bg-neon-green text-black font-black text-xl rounded-xl hover:bg-white transition-colors">JOIN LOBBY</button>
-      )}
-      {txError && (
-        <div className="mt-4 p-4 bg-red-900/30 border border-red-500 rounded-lg text-red-400 text-sm">
-          {txError}
+
+      <div className="max-w-3xl mx-auto text-center px-4">
+        <h1 className="text-6xl md:text-7xl font-black text-transparent bg-clip-text bg-gradient-to-r from-neon-green via-neon-blue to-neon-purple mb-6 tracking-tighter">
+          FOCUS ROYALE
+        </h1>
+        <p className="text-gray-400/90 text-lg md:text-xl mb-12 max-w-2xl mx-auto leading-relaxed">
+          <span>Stake SOL.</span>{' '}
+          <span className="font-semibold text-transparent bg-clip-text bg-gradient-to-r from-neon-green via-neon-blue to-neon-purple">
+            Out-focus your rivals.
+          </span>{' '}
+          <span>Top score takes the pot.</span>
+        </p>
+        <div className="mb-10">
+          <span className="inline-flex pill px-5 py-2 md:px-6 md:py-2.5 rounded-full text-sm md:text-base lg:text-lg font-mono font-bold tracking-widest text-neon-purple/90">
+            BET ON YOURSELF
+          </span>
         </div>
-      )}
-    </div>
+
+        <div className="animated-border rounded-3xl mb-10 mx-auto max-w-xl">
+          <div className="content glass-panel p-10 rounded-3xl relative overflow-hidden group">
+            <div className="pointer-events-none absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity">
+              <div className="absolute inset-x-0 top-0 h-px bg-white/10"></div>
+              <div className="absolute inset-0 translate-y-[-100%] h-full animate-scanline" style={{ background: 'linear-gradient(to bottom, transparent, rgba(255,255,255,0.06), transparent)' }}></div>
+            </div>
+            <div className="relative z-10">
+              <h2 className="text-2xl font-bold mb-4 text-white">Ready to Compete?</h2>
+              {wallet.connected && wallet.publicKey && (
+                <div className="mb-6 text-left bg-dark-800 p-4 rounded-lg">
+                  <div className="text-sm text-gray-400 mb-2">Wallet Address</div>
+                  <div className="text-xs font-mono text-neon-green break-all">{wallet.publicKey.toString()}</div>
+                </div>
+              )}
+              <button
+                onClick={handleConnectWallet}
+                disabled={wallet.connected}
+                className={`px-8 py-4 rounded-full font-bold text-lg transition-all flex items-center gap-2 mx-auto ${wallet.connected ? 'bg-gray-800 text-green-400 cursor-default border border-green-500' : 'btn-neo'}`}
+              >
+                <Wallet size={20} />
+                {wallet.connected ? 'Wallet Connected' : 'Connect Wallet to Enter'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {wallet.connected && (
+          <button
+            onClick={handleJoin}
+            className="w-full max-w-md mx-auto block px-8 py-4 rounded-xl font-black text-xl bg-neon-green text-black hover:bg-white transition-colors"
+          >
+            JOIN LOBBY
+          </button>
+        )}
+        {txError && (
+          <div className="mt-4 p-4 bg-red-900/30 border border-red-500 rounded-lg text-red-400 text-sm">
+            {txError}
+          </div>
+        )}
+      </div>
+    </section>
   );
 
   const renderStaking = () => (
@@ -513,9 +588,7 @@ export default function App() {
             className="w-full bg-dark-900 border border-gray-700 rounded-lg p-4 text-2xl font-mono text-white focus:border-neon-green outline-none" 
             step="0.01" 
             min="0.01"
-            max={solBalance}
           />
-          <div className="text-xs text-gray-500 mt-2 text-left">Available: {solBalance.toFixed(4)} SOL</div>
         </div>
         {escrowAccount && (
           <div className="mb-4 p-3 bg-dark-800 rounded-lg text-left">
@@ -526,7 +599,7 @@ export default function App() {
         )}
         <button 
           onClick={handleStartGame} 
-          disabled={isLoadingTx || stakeAmount <= 0 || (solBalance > 0 && stakeAmount > solBalance)}
+          disabled={isLoadingTx || stakeAmount <= 0}
           className="w-full mt-8 bg-neon-blue text-black font-bold py-4 rounded-xl hover:bg-white transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {isLoadingTx ? 'Processing...' : 'LOCK IN & START'} <ArrowRight size={20} />
@@ -551,9 +624,7 @@ export default function App() {
         </div>
         <div className="flex items-center gap-4 text-sm font-mono">
           <div className="text-neon-purple">POT: {getTotalPot().toFixed(2)} SOL</div>
-          {wallet.publicKey && (
-            <div className="text-gray-400">Balance: {solBalance.toFixed(4)} SOL</div>
-          )}
+          <div className="text-gray-400">Stake: {stakeAmount.toFixed(2)} SOL</div>
         </div>
       </header>
 
@@ -694,6 +765,19 @@ export default function App() {
           FORFEIT
         </button>
       </div>
+      {sessionStartTime && ((Date.now() - sessionStartTime) < (SESSION_DURATION_MINUTES * 60 * 1000)) && (
+        <div className="fixed bottom-4 left-4 translate-y-10 text-gray-400 text-[10px] font-mono">
+          Minimum session is one minute (testing). Time remaining: {
+            (() => {
+              const remaining = (SESSION_DURATION_MINUTES * 60 * 1000) - (Date.now() - sessionStartTime);
+              const secs = Math.max(0, Math.ceil(remaining / 1000));
+              const m = Math.floor(secs / 60);
+              const s = secs % 60;
+              return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+            })()
+          }
+        </div>
+      )}
       {txError && (
         <div className="fixed bottom-4 right-4 p-3 bg-red-900/30 border border-red-500 rounded-lg text-red-400 text-xs max-w-sm">
           {txError}
@@ -702,41 +786,37 @@ export default function App() {
     </div>
   );
 
-  const renderVerifying = () => (
-    <div className="h-screen flex flex-col items-center justify-center bg-dark-900 relative overflow-hidden">
-      <div className="z-10 text-center">
-        <div className="w-24 h-24 border-4 border-neon-blue border-t-transparent rounded-full animate-spin mx-auto mb-8"></div>
-        <h2 className="text-3xl font-bold text-white mb-4">Gemini is Verifying Proof of Work...</h2>
-        <p className="text-gray-400 max-w-md mx-auto animate-pulse">Analyzing semantic density, code coherence, and biometric logs...</p>
-      </div>
-    </div>
-  );
+  // Verification view (simulation mode): return null to keep UI snappy if referenced
+  const renderVerifying = () => null;
 
   const renderResults = () => {
     const winner = [...players].sort((a, b) => b.flowScore - a.flowScore)[0] || initializeSelf();
     const isWinner = winner.isSelf;
+    const pot = getTotalPot();
+    const winnerPayout = payouts ? payouts[winner.id] : pot;
     return (
       <div className="min-h-screen bg-dark-900 py-20 px-4">
         <div className="max-w-4xl mx-auto">
           <div className="text-center mb-12">
             <h1 className="text-5xl font-black text-white mb-2">SESSION COMPLETE</h1>
-            <div className="text-neon-purple font-mono text-xl">POT DISTRIBUTED</div>
+            <div className="text-neon-purple font-mono text-xl">POT DISTRIBUTED (SIMULATED)</div>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
             <div className="glass-panel p-8 rounded-2xl border border-gray-700">
-              <h3 className="text-neon-blue font-bold mb-6 flex items-center gap-2"><Eye size={20} /> GEMINI AUDIT REPORT</h3>
+              <h3 className="text-neon-blue font-bold mb-6 flex items-center gap-2"><Eye size={20} /> SESSION SUMMARY</h3>
               <div className="space-y-6">
                 <div>
-                  <label className="text-xs text-gray-500 font-mono">PRODUCTIVITY SCORE</label>
-                  <div className="text-4xl font-bold text-white">{verificationResult?.score || 0}/100</div>
+                  <label className="text-xs text-gray-500 font-mono">RULES APPLIED</label>
+                  <p className="text-gray-300 mt-2 text-sm">
+                    Distracted time converted into penalties from each player’s stake.
+                    Penalty pool was split equally among the top performer(s) by focus score.
+                  </p>
                 </div>
                 <div>
-                  <label className="text-xs text-gray-500 font-mono">AI COMMENTARY</label>
-                  <p className="text-gray-300 italic border-l-2 border-neon-blue pl-4 mt-2">"{verificationResult?.comment}"</p>
-                </div>
-                <div>
-                  <label className="text-xs text-gray-500 font-mono">BIOMETRIC INTEGRITY</label>
-                  <div className="text-green-400 mt-1 flex items-center gap-2"><ShieldCheck size={16} /> VERIFIED (Presage)</div>
+                  <label className="text-xs text-gray-500 font-mono">NOTES</label>
+                  <p className="text-gray-400 text-xs mt-2">
+                    This is a simulation only. No on-chain transfers occurred.
+                  </p>
                 </div>
               </div>
             </div>
@@ -748,16 +828,24 @@ export default function App() {
                 <p className="text-gray-400 font-mono text-sm mb-6">Total Flow Score: {Math.floor(winner.flowScore)}</p>
                 <div className="bg-dark-800 rounded-xl p-6 w-full">
                   <div className="text-gray-500 text-sm mb-1">Payout</div>
-                  <div className="text-4xl font-mono font-bold text-neon-green">{getTotalPot().toFixed(2)} SOL</div>
-                  {isWinner && wallet.connected && (
-                    <button
-                      onClick={handleClaimReward}
-                      disabled={isLoadingTx}
-                      className="mt-4 w-full bg-neon-green text-black font-bold py-3 rounded-lg hover:bg-white transition-colors disabled:opacity-50"
-                    >
-                      {isLoadingTx ? 'Claiming...' : 'CLAIM REWARD'}
-                    </button>
-                  )}
+                  <div className="text-4xl font-mono font-bold text-neon-green">{winnerPayout.toFixed(2)} SOL</div>
+                  <div className="mt-2 text-xs text-gray-400 font-mono">Simulated distribution only. No on-chain transfer.</div>
+                  <div className="mt-4">
+                    <div className="text-gray-400 text-xs font-mono mb-2">Distribution</div>
+                    <div className="space-y-2">
+                      {players.map(p => (
+                        <div key={p.id} className="flex justify-between text-sm">
+                          <span className={`font-mono ${p.isSelf ? 'text-neon-blue' : 'text-gray-300'}`}>
+                            {p.name} {p.status !== 'FOCUS' ? '(distracted)' : ''}
+                          </span>
+                          <div className="flex items-center gap-6">
+                            <span className="font-mono text-gray-400">Score: {Math.floor(p.flowScore)}</span>
+                            <span className="font-mono text-white">{(payouts ? payouts[p.id] : stakeAmount).toFixed(2)} SOL</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>

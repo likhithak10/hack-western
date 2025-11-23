@@ -20,6 +20,13 @@ const SMOOTH_EYES_CLOSED_MS = Number((process.env.SMOOTH_EYES_CLOSED_MS as any) 
 const SMOOTH_NO_FACE_MS = Number((process.env.SMOOTH_NO_FACE_MS as any) || 400);
 const SMOOTH_OTHER_MS = Number((process.env.SMOOTH_OTHER_MS as any) || 250);
 const SMOOTH_RECOVERY_MS = Number((process.env.SMOOTH_RECOVERY_MS as any) || 200);
+// Enable remote backend only when explicitly configured (prevents noisy websocket errors)
+let REMOTE_BACKEND_ENABLED = false;
+try {
+  REMOTE_BACKEND_ENABLED = ((import.meta as any).env?.VITE_REMOTE_BACKEND === 'true');
+} catch {
+  REMOTE_BACKEND_ENABLED = false;
+}
 
 // Local smoothing state (debounce transient misclassifications like blinks)
 let candidateType: DistractionType = 'NONE';
@@ -68,11 +75,15 @@ function smoothLocalDetection(detected: DistractionType): DistractionType {
 // 2. Frame Processing Pipeline
 export const processFrame = async (base64Frame: string): Promise<DistractionType> => {
   // Attempt to send to backend (for vitals / pipeline)
-  if (!socketService.isConnected()) {
-    socketService.connect();
+  if (REMOTE_BACKEND_ENABLED) {
+    if (!socketService.isConnected()) {
+      socketService.connect();
+    }
+    const sentToSocket = socketService.isConnected() ? (socketService.sendFrame(base64Frame), true) : false;
+    isRemoteActive = sentToSocket;
+  } else {
+    isRemoteActive = false;
   }
-  const sentToSocket = socketService.isConnected() ? (socketService.sendFrame(base64Frame), true) : false;
-  isRemoteActive = sentToSocket;
 
   // Always compute distraction locally via Gemini:
   // - pure fallback when remote is not active, or
@@ -95,13 +106,15 @@ export const processFrame = async (base64Frame: string): Promise<DistractionType
 
 // --- State Management ---
 
-// Initialize Socket Listeners
-socketService.onBiometricUpdate((data: Partial<BiometricData>) => {
-  if (data.distractionType) currentDistraction = data.distractionType as DistractionType;
-  if (typeof data.heartRate === 'number') currentHeartRate = data.heartRate;
-  if (typeof data.gazeStability === 'number') currentGazeStability = data.gazeStability;
-  isRemoteActive = true;
-});
+// Initialize Socket Listeners (only when remote is enabled)
+if (REMOTE_BACKEND_ENABLED) {
+  socketService.onBiometricUpdate((data: Partial<BiometricData>) => {
+    if (data.distractionType) currentDistraction = data.distractionType as DistractionType;
+    if (typeof data.heartRate === 'number') currentHeartRate = data.heartRate;
+    if (typeof data.gazeStability === 'number') currentGazeStability = data.gazeStability;
+    isRemoteActive = true;
+  });
+}
 
 const updateLocalState = (detectedType: DistractionType) => {
   currentDistraction = detectedType;
